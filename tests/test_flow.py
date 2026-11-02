@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""flow.py（v2 轻量守卫）回归测试：只测真风险拦截 + 正常路径不被误拦。"""
+import json
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(ROOT))
+import flow as F  # noqa: E402
+
+pytestmark = pytest.mark.flow
+
+
+@pytest.fixture
+def proj(tmp_path, monkeypatch):
+    monkeypatch.setattr(F, "ROOT", tmp_path)
+    monkeypatch.setattr(F, "WORKSPACE", tmp_path / "workspace")
+    monkeypatch.setattr(F, "POLICY_PATH", tmp_path / "video_production_policy.json")
+    monkeypatch.setattr(F, "RULES_PATH", tmp_path / "platform_rules.json")
+    monkeypatch.setattr(F, "GEN_LEDGER", tmp_path / "workspace" / "production_ledger.jsonl")
+    monkeypatch.setattr(F, "HISTORY_PATH", tmp_path / "performance_history.jsonl")
+    F.main(["init", "--series", "测试系列", "--model", "seedance_2.5", "--account", "测试号"])
+    rules = json.loads((tmp_path / "platform_rules.json").read_text())
+    rules["platforms"]["xiaohongshu"]["original_declaration_target"] = "已启用原创声明"
+    (tmp_path / "platform_rules.json").write_text(json.dumps(rules, ensure_ascii=False))
+    return tmp_path
+
+
+def run(*argv):
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = F.main(list(argv))
+    return code, json.loads(buf.getvalue())
+
+
+def plan(p: Path, **kw):
+    d = {"candidate_id": "cand-x", "prompt": "画面", "user_approval": {"quote": "可以，生成吧"},
+         "locked_parameters": {"model_version": "seedance_2.5", "fallback_allowed": False,
+                               "target_duration_seconds": 29, "aspect_ratio": "9:16",
+                               "video_count": 1, "segments_seconds": [29]}}
+    for k, v in kw.items():
+        if k in d["locked_parameters"]:
+            d["locked_parameters"][k] = v
+        else:
+            d[k] = v
+    p.write_text(json.dumps(d, ensure_ascii=False))
+    return str(p)
+
+
+# ---------------------------------------------------------------- 生成
+def test_gen_check_ok_then_blocks_repeat_and_unknown(proj):
+    pp = plan(proj / "plan.json")
+    assert run("gen-check", "--plan", pp)[0] == 0
+    run("gen-log", "--plan", pp, "--status", "unknown")
+    code, r = run("gen-check", "--plan", pp)
+    assert code == 2 and "结果未知" in r["error"]
+    receipt = proj / "receipt.json"
+    receipt.write_text(json.dumps({"status": "succeeded", "url": "https://example.test/video.mp4"}), encoding="utf-8")
+    assert run("gen-log", "--plan", pp, "--status", "succeeded", "--evidence", str(receipt),
+               "--url", "https://example.test/video.mp4")[0] == 0
+    code, r = run("gen-check", "--plan", pp)
+    assert code == 2 and "重生" in r["error"]
+    assert run("gen-check", "--plan", pp, "--regen-approved", "重做一版")[0] == 0
+
+
+@pytest.mark.parametrize("kw,needle", [
+    ({"model_version": "seedance_2.0"}, "禁止降级"),
+    ({"fallback_allowed": True}, "fallback"),
+    ({"segments_seconds": [15, 14]}, "单条"),
+    ({"aspect_ratio": "16:9"}, "画幅"),
+    ({"user_approval": {}}, "原话"),
+])
+def test_gen_check_real_risks(proj, kw, needle):
+    code, r = run("gen-check", "--plan", plan(proj / "p.json", **kw))
+    assert code == 2 and needle in r["error"]
+
+
+# ---------------------------------------------------------------- 生成等待/回执留痕
+@pytest.mark.parametrize("status", ["submitting", "submitted", "unknown"])
+def test_inflight_cannot_bypass_with_regen_approval(proj, status):
+    pp = plan(proj / "p.json")
+    if status == "submitting":
+        assert run("gen-start", "--plan", pp)[0] == 0
+    else:
+        assert run("gen-log", "--plan", pp, "--status", status)[0] == 0
+    before = F.GEN_LEDGER.read_bytes()
+    for cmd in ("gen-check", "gen-start"):
+        code, result = run(cmd, "--plan", pp, "--regen-approved", "重做一版")
+        assert code == 2 and "重生" in result["error"]
+    assert F.GEN_LEDGER.read_bytes() == before
+
+
+# ---------------------------------------------------------------- 一次性正式授权例外
+def _exc_evidence(proj, quote="按要求生成"):
+    p = proj / "exception-authorization.json"
+    p.write_text(json.dumps({
+        "question": "是否接受可能重复消耗额度，授权本次例外：在原生成结果仍未知的情况下，按已确认方案新生成一次？",
+        "selected_option": "按要求生成",
+        "source": "本轮正式工具封闭单选确认（MainAgent 传达）",
+        "authorization_quote": quote,
+    }, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_exception_once_allows_new_attempt_keeps_old_unknown(proj):
+    pp = plan(proj / "p.json")
+    assert run("gen-log", "--plan", pp, "--status", "unknown")[0] == 0
+    old_first = F.GEN_LEDGER.read_bytes().splitlines()[0]
+    ev = _exc_evidence(proj)
+    # 无例外标志：unknown 仍阻断，regen-approved 也不能越过
+    assert run("gen-check", "--plan", pp, "--regen-approved", "重做")[0] == 2
+    assert run("gen-start", "--plan", pp, "--exception-approved", "按要求生成")[0] == 2  # 缺证据
+    assert run("gen-start", "--plan", pp, "--exception-evidence", str(ev))[0] == 2  # 缺原话
+    code, r = run("gen-check", "--plan", pp, "--exception-approved", "按要求生成", "--exception-evidence", str(ev))
+    assert code == 0 and r["exception"]["evidence"]["sha256"] == F.sha256_file(ev)
+    code, r = run("gen-start", "--plan", pp, "--exception-approved", "按要求生成", "--exception-evidence", str(ev))
+    assert code == 0 and r["logged"]["attempt_id"] == "attempt-2"
+    # 旧 unknown 行字节未改
+    assert F.GEN_LEDGER.read_bytes().splitlines()[0] == old_first
+    # 新 attempt 记成功回执；同一旧 unknown 的第二次例外被重复消费阻断
+    receipt = proj / "receipt.json"
+    receipt.write_text(json.dumps({"status": "succeeded", "url": "https://example.test/v.mp4"}), encoding="utf-8")
+    assert run("gen-log", "--plan", pp, "--status", "succeeded", "--evidence", str(receipt),
+               "--url", "https://example.test/v.mp4")[0] == 0
+    last = F.read_jsonl(F.GEN_LEDGER)[-1]
+    assert last["attempt_id"] == "attempt-2" and last["status"] == "succeeded"
+    code, r = run("gen-start", "--plan", pp, "--exception-approved", "按要求生成", "--exception-evidence", str(ev))
+    assert code == 2 and "重复消耗" in r["error"]
+
+
+def test_exception_blocks_missing_or_empty_evidence_and_non_unknown(proj):
+    pp = plan(proj / "p.json")
+    assert run("gen-log", "--plan", pp, "--status", "unknown")[0] == 0
+    ev = _exc_evidence(proj)
+    code, r = run("gen-check", "--plan", pp, "--exception-approved", "按要求生成", "--exception-evidence", "missing.json")
+    assert code == 2 and "证据" in r["error"]
+    (proj / "empty.json").write_text("", encoding="utf-8")
+    assert run("gen-check", "--plan", pp, "--exception-approved", "按要求生成",
+               "--exception-evidence", str(proj / "empty.json"))[0] == 2
+    # 末态不是 unknown：例外路径不适用，按常规规则走
+    pp2 = plan(proj / "p2.json", candidate_id="cand-y")
+    assert run("gen-check", "--plan", pp2, "--exception-approved", "按要求生成", "--exception-evidence", str(ev))[0] == 0
+
+
+def test_gen_start_validates_before_reserving(proj):
+    pp = plan(proj / "p.json", user_approval={})
+    assert run("gen-start", "--plan", pp)[0] == 2
+    assert not F.GEN_LEDGER.exists()
+    pp = plan(proj / "p.json")
+    code, result = run("gen-start", "--plan", pp)
+    assert code == 0 and result["logged"]["status"] == "submitting"
+    assert result["logged"]["plan_sha256"] == F.sha256_file(Path(pp))
+    assert "不代表服务端" in result["logged"]["note"]
+
+
+def test_gen_start_two_processes_allow_only_one_reservation(proj):
+    import os
+    pp = plan(proj / "p.json")
+    cmd = [sys.executable, "-B", str(Path(F.__file__).resolve()), "gen-start", "--plan", pp]
+    env = dict(os.environ, FLOW_ROOT=str(proj))
+    workers = [subprocess.Popen(cmd, cwd=proj, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for _ in range(2)]
+    outputs = [w.communicate(timeout=15) for w in workers]
+    assert sorted(w.returncode for w in workers) == [0, 2]
+    assert all(json.loads(stdout)["ok"] == (w.returncode == 0)
+               for w, (stdout, _) in zip(workers, outputs))
+    assert len(F.read_jsonl(F.GEN_LEDGER)) == 1
+    # 新进程也不能凭重做批准覆盖未结束占位。
+    retry = subprocess.run(cmd + ["--regen-approved", "重做"], cwd=proj, env=env,
+                           capture_output=True, text=True, timeout=15)
+    assert retry.returncode == 2 and "等待结果" in json.loads(retry.stdout)["error"]
+
+
+@pytest.mark.parametrize("status", ["failed", "succeeded"])
+def test_gen_terminal_requires_nonempty_evidence(proj, status):
+    pp = plan(proj / "p.json")
+    assert run("gen-log", "--plan", pp, "--status", "unknown")[0] == 0
+    before = F.GEN_LEDGER.read_bytes()
+    args = ["gen-log", "--plan", pp, "--status", status, "--url", "https://example.test/video.mp4"]
+    assert run(*args)[0] == 2
+    assert run(*args, "--evidence", "missing.txt")[0] == 2
+    (proj / "empty.txt").write_text("", encoding="utf-8")
+    assert run(*args, "--evidence", "empty.txt")[0] == 2
+    assert F.GEN_LEDGER.read_bytes() == before
+
+
+def test_gen_receipt_success_and_failure_recovery(proj):
+    pp = plan(proj / "p.json")
+    assert run("gen-start", "--plan", pp)[0] == 0
+    assert run("gen-log", "--plan", pp, "--status", "unknown")[0] == 0
+    assert run("gen-log", "--plan", pp, "--status", "submitted")[0] == 2
+    receipt = proj / "receipt.json"
+    receipt.write_text(json.dumps({"status": "failed", "reason": "fixture: not accepted"}), encoding="utf-8")
+    code, result = run("gen-log", "--plan", pp, "--status", "failed", "--evidence", "receipt.json")
+    assert code == 0 and result["logged"]["evidence"] == {"path": "receipt.json", "sha256": F.sha256_file(receipt)}
+    assert run("gen-start", "--plan", pp)[0] == 0
+    receipt.write_text(json.dumps({"status": "succeeded", "url": "https://example.test/video.mp4"}), encoding="utf-8")
+    before = F.GEN_LEDGER.read_bytes()
+    assert run("gen-log", "--plan", pp, "--status", "succeeded", "--evidence", "receipt.json")[0] == 2
+    assert F.GEN_LEDGER.read_bytes() == before
+    assert run("gen-log", "--plan", pp, "--status", "succeeded", "--evidence", "receipt.json",
+               "--url", "https://example.test/video.mp4")[0] == 0
+    assert run("gen-start", "--plan", pp)[0] == 2
+    assert run("gen-start", "--plan", pp, "--regen-approved", "重做一版")[0] == 0
+
+
+# ---------------------------------------------------------------- 成片
+def _make_video(path: Path, seconds=29, w=720, h=1280, vol="1.0"):
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:d={seconds}:r=24",
+                    "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}", "-af", f"volume={vol}",
+                    "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)], check=True)
+
+
+ffmpeg = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="需要 ffmpeg")
+
+
+@ffmpeg
+def test_master_check_ok_and_quiet_and_short(proj):
+    ok = proj / "ok.mp4"; _make_video(ok)
+    code, r = run("master-check", "--master", str(ok))
+    assert code == 0 and r["sha256"].startswith("sha256:")
+    short = proj / "short.mp4"; _make_video(short, seconds=26)
+    assert run("master-check", "--master", str(short))[0] == 2
+    quiet = proj / "quiet.mp4"; _make_video(quiet, vol="0.005")
+    code, r = run("master-check", "--master", str(quiet))
+    assert code == 2 and "响度" in r["error"]
+
+
+# ---------------------------------------------------------------- 发布
+def _day(proj, platforms=("douyin", "kuaishou", "xiaohongshu")):
+    day = proj / "workspace" / "2026-11-01"
+    day.mkdir(parents=True)
+    m = day / "m.mp4"; m.write_bytes(b"fake-master")
+    (day / "c.jpg").write_bytes(b"cover")
+    plats = {}
+    for p in platforms:
+        plats[p] = {"title": "贝多芬拒弹", "description": "简介", "topics": ["#贝多芬"],
+                    "ai_disclosure": "含AI生成内容", "original_declaration": "NOT_SUPPORTED"}
+    if "xiaohongshu" in plats:
+        plats["xiaohongshu"]["original_declaration"] = "已启用原创声明"
+    pack = {"episode_id": "ep20261101-x", "master": {"path": "m.mp4", "sha256": F.sha256_file(m),
+                                                    "duration_seconds": 29, "cover_path": "c.jpg"},
+            "platforms": plats}
+    (day / "publish_pack.json").write_text(json.dumps(pack, ensure_ascii=False))
+    (day / "shot.png").write_bytes(b"png")
+    return day, pack
+
+
+def _write_pack(day, pack):
+    (day / "publish_pack.json").write_text(json.dumps(pack, ensure_ascii=False))
+
+
+@pytest.mark.parametrize("mutate,needle", [
+    (lambda pk: pk["platforms"]["xiaohongshu"].update(original_declaration="NOT_SUPPORTED"), "原创声明"),
+    (lambda pk: pk["platforms"]["douyin"].update(ai_disclosure=""), "AI 标识"),
+    (lambda pk: pk["platforms"]["xiaohongshu"].update(title="一" * 21), "上限 20"),
+    (lambda pk: pk["platforms"]["kuaishou"].update(topics=["#a", "#b", "#c", "#d", "#e"]), "上限 4"),
+    (lambda pk: pk["platforms"]["douyin"].update(description="TODO"), "占位"),
+    (lambda pk: pk["master"].update(sha256="sha256:" + "0" * 64), "sha256"),
+])
+def test_pack_check_blocks(proj, mutate, needle):
+    day, pack = _day(proj)
+    mutate(pack); _write_pack(day, pack)
+    code, r = run("pack-check", "--day-dir", str(day))
+    assert code == 2 and needle in r["error"]
+
+
+def test_publish_happy_path_and_windows(proj):
+    day, _ = _day(proj)
+    code, r = run("pack-check", "--day-dir", str(day))
+    assert code == 0 and r["release_approved"] is False
+    code, r = run("start", "--day-dir", str(day), "--platform", "douyin")
+    assert code == 2 and "批准" in r["error"]
+    assert run("pack-check", "--day-dir", str(day), "--approved", "可以，全平台发布")[0] == 0
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 0
+    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "under_review")
+    assert code == 2 and "截图" in r["error"]
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "under_review", "--evidence", "shot.png")[0] == 0
+    pub = (datetime.now().astimezone() - timedelta(hours=30)).isoformat(timespec="seconds")
+    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--post-id", "123", "--published-at", pub)
+    assert code == 0 and r["state"] == "PUBLISHED"
+    # 一期一平台一条
+    code, r = run("start", "--day-dir", str(day), "--platform", "douyin")
+    assert code == 2 and "已投稿" in r["error"]
+    # 窗口：w24 到期、w48 未到
+    due = run("metrics-due")[1]
+    assert [(x["platform"], x["window"]) for x in due["due"]] == [("douyin", "w24")]
+    code, r = run("metric-add", "--day-dir", str(day), "--platform", "douyin", "--window", "w48", "--evidence", "shot.png", "--plays", "5")
+    assert code == 2 and "提前" in r["error"]
+    code, r = run("metric-add", "--day-dir", str(day), "--platform", "douyin", "--window", "w24", "--evidence", "shot.png")
+    assert code == 2 and "补零" in r["error"]
+    code, r = run("metric-add", "--day-dir", str(day), "--platform", "douyin", "--window", "w24", "--evidence", "shot.png", "--plays", "120", "--likes", "3")
+    assert code == 0 and r["history_appended"]
+    hist = [json.loads(x) for x in (proj / "performance_history.jsonl").read_text().splitlines()]
+    assert hist[-1]["metric_cells"]["plays"]["value"] == 120 and hist[-1]["metric_cells"]["completion_rate"]["status"] == "NOT_PROVIDED"
+    assert run("metric-add", "--day-dir", str(day), "--platform", "douyin", "--window", "w24", "--evidence", "shot.png", "--plays", "1")[0] == 2
+
+
+def test_unknown_result_blocks_resubmit_until_verified(proj):
+    day, _ = _day(proj)
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "kuaishou")
+    # 中断：仍是 SUBMITTING
+    code, r = run("start", "--day-dir", str(day), "--platform", "kuaishou")
+    assert code == 2 and "禁止重新投稿" in r["error"]
+    run("done", "--day-dir", str(day), "--platform", "kuaishou", "--result", "unknown")
+    code, r = run("done", "--day-dir", str(day), "--platform", "kuaishou", "--result", "published")
+    assert code == 2 and "核查" in r["error"]
+    assert run("done", "--day-dir", str(day), "--platform", "kuaishou", "--result", "published", "--evidence", "shot.png")[0] == 0
+
+
+def test_no_post_id_still_opens_windows(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    assert code == 0 and "warning" in r
+    st = json.loads((day / "publish_status.json").read_text())["platforms"]["douyin"]
+    assert set(st["windows"]) == {"w24", "w48", "w7d"}
+
+
+def test_cross_day_duplicate_master_blocked(proj):
+    day, pack = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "under_review", "--evidence", "shot.png")
+    day2 = proj / "workspace" / "2026-11-02"; day2.mkdir()
+    shutil.copy(day / "m.mp4", day2 / "m.mp4"); shutil.copy(day / "c.jpg", day2 / "c.jpg")
+    pack["episode_id"] = "ep20261102-y"; _write_pack(day2, pack)
+    run("pack-check", "--day-dir", str(day2), "--approved", "发吧")
+    code, r = run("start", "--day-dir", str(day2), "--platform", "douyin")
+    assert code == 2 and "其他日期" in r["error"]
+
+
+def test_v1_status_is_converted_with_backup(proj):
+    day = proj / "workspace" / "2026-10-15"; day.mkdir(parents=True)
+    v1 = {"schema_version": "1.0", "episode_id": "ep-old", "master": {"sha256": "sha256:abc"},
+          "platforms": {"douyin": {"state": "PUBLIC_VERIFIED", "attempts": [{"platform_published_at": "2026-10-18T15:14:15+08:00"}],
+                                   "evidence": [{"path": "a.png", "post_id": "77", "public_url": "https://x"}], "events": []},
+                        "wechat_channels": {"state": "SUBMITTING", "attempts": [{}], "evidence": [], "events": []}}}
+    (day / "publish_status.json").write_text(json.dumps(v1))
+    code, r = run("status", "--day-dir", str(day))
+    assert code == 0
+    p = r["episodes"]["2026-10-15"]["platforms"]
+    assert p["douyin"] == {"state": "PUBLISHED", "post_id": "77", "published_at": "2026-10-18T15:14:15+08:00"}
+    assert p["wechat_channels"]["state"] == "UNKNOWN"
+    # 只读命令不改文件
+    assert json.loads((day / "publish_status.json").read_text())["schema_version"] == "1.0"
+    assert not (day / "publish_status.v1-backup.json").exists()
+    # 首次写入才落盘并备份
+    (day / "shot.png").write_bytes(b"png")
+    assert run("done", "--day-dir", str(day), "--platform", "wechat_channels", "--result", "published", "--evidence", "shot.png")[0] == 0
+    assert (day / "publish_status.v1-backup.json").exists()
+    assert json.loads((day / "publish_status.json").read_text())["schema_version"] == "2"
+
+
+# ---------------------------------------------------------------- 选题
+def test_topics_dedup_rejected_and_history(proj):
+    bank = {"topics": {
+        "ravel-concerto-left-hand-wittgenstein": {"composer": "ravel", "title": "拉威尔", "_evidence": {"editorial_score": 41}},
+        "liszt-gloves": {"composer": "liszt", "title": "李斯特", "_evidence": {"editorial_score": 30}},
+        "chopin-x": {"composer": "chopin", "title": "肖邦", "_evidence": {"editorial_score": 30}},
+        "fanny-y": {"composer": "mendelssohn", "title": "范妮", "_evidence": {"editorial_score": 50}}},
+        "rejected": ["fanny-y"]}
+    (proj / "topic_bank.json").write_text(json.dumps(bank, ensure_ascii=False))
+    day = proj / "workspace" / "2026-10-10"; day.mkdir(parents=True)
+    (day / "publish_status.json").write_text(json.dumps({"schema_version": "2", "episode_id": "ep20261010-ravel-left-hand-concerto", "platforms": {}}))
+    rows = []
+    for plat in ("douyin", "kuaishou", "bilibili"):
+        for subj, plays in (("liszt", 900), ("chopin", 100)):
+            rows.append({"object_type": "performance_observation", "platform": plat, "work_id": f"{plat}-{subj}",
+                         "collected_at": "2026-10-01T00:00:00+08:00", "features": {"composer": subj},
+                         "metric_cells": {"plays": {"value": plays}}})
+    (proj / "performance_history.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    code, r = run("topics")
+    assert code == 0
+    slugs = [c["slug"] for c in r["candidates"]]
+    assert "ravel-concerto-left-hand-wittgenstein" not in slugs and "fanny-y" not in slugs
+    assert slugs == ["liszt-gloves", "chopin-x"]
+    assert r["subject_history"]["liszt"] == {"score": 1.0, "n": 3} and r["candidates"][0]["history_used"]
+
+
+def test_rejected_can_resubmit_but_counts_attempt(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "rejected", "--evidence", "shot.png")
+    code, r = run("start", "--day-dir", str(day), "--platform", "douyin")
+    assert code == 0 and r["attempt"] == 2 and r["resubmit_after_reject"]
+
+
+def test_corrupt_json_and_missing_ffmpeg_are_friendly(proj, monkeypatch):
+    day, _ = _day(proj, platforms=("douyin",))
+    (day / "publish_pack.json").write_text("{坏的")
+    code, r = run("pack-check", "--day-dir", str(day))
+    assert code == 2 and "损坏" in r["error"]
+    monkeypatch.setenv("PATH", "/nonexistent")
+    (day / "v.mp4").write_bytes(b"x")
+    code, r = run("master-check", "--master", str(day / "v.mp4"))
+    assert code == 2 and "ffmpeg" in r["error"]
+
+
+def test_concurrent_writer_blocked(proj):
+    import fcntl
+    (proj / "workspace").mkdir(exist_ok=True)
+    fh = open(proj / "workspace" / ".flow.lock", "w"); fcntl.flock(fh, fcntl.LOCK_EX)
+    try:
+        code, r = run("gen-log", "--plan", plan(proj / "p.json"), "--status", "submitted")
+        assert code == 2 and "正在写入" in r["error"]
+        assert run("status")[0] == 0  # 只读不受锁影响
+    finally:
+        fh.close()
