@@ -23,14 +23,16 @@ description: 短视频系列从选题（题库去重+历史表现打分）、脚
 
 ## 主流程
 
-完整步骤、命令和平台坑点见 `references/workflow.md`；内容怎么做出彩见 `references/craft.md`（写脚本前必读）。
+完整步骤、命令和平台坑点见 `references/workflow.md`；内容怎么做出彩见 `references/craft.md`（写脚本前必读）；五平台现场操作（声明位置、时区、视频号上传）见 `references/platforms.md`。
 
 ```
-0 开工   metrics-due → 采完到期数据（metric-add）
+0 开工   metrics-due → 采完到期数据（metric-add）；顺手处理 status 的 followups
 1 选题   flow.py topics 参考 + 当日联网找新题（主角大众熟知、够抓马）
-2 脚本   强钩子 + 单旁白 + 反转 + 主页导流；自查史实          ✋ 确认①
+2 脚本   强钩子+单旁白+反转+主页导流；同款 TTS 实测旁白 26–27s；自查史实   ✋ 确认①
 3 生成   gen-check → gen-start → 单次提交并静默等待 → 保存回执 → gen-log
-4 后期   配音字幕响度 → master-check → 回听+抽帧自检         ✋ 确认②
+         原片到手先 raw-check（抽帧拼图看伪品牌/伪文字）
+4 后期   配音不换；逐句时间轴+字幕；声画错位优先重剪原片（不重新生成）
+         master-check --timeline 时间轴.json（EBU R128 响度+对齐报警）→ ASR 回听+抽帧   ✋ 确认②
 5 发布   pack-check --approved "原话"；每平台 start → 现场发布 → 截图 → done
 6 收尾   审核中的稍后复查 done --result published（自动建 24h/48h/7d 窗口）；PROJECT_STATE 追加一条
 ```

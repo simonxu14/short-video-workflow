@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-VERSION = "2.1.3"
+VERSION = "2.2.0"
 def _find_root() -> Path:
     """项目根：环境变量 FLOW_ROOT > 当前目录（含配置时）> 脚本所在目录。避免在错误目录里静默新建配置。"""
     env = os.environ.get("FLOW_ROOT")
@@ -397,6 +398,75 @@ def _mean_volume(path: Path) -> Optional[float]:
     return None
 
 
+def _loudness(path: Path) -> Dict[str, Optional[float]]:
+    """EBU R128 响度（integrated LUFS / true peak dBTP / LRA）。解析不到时各字段为 None。"""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    out: Dict[str, Optional[float]] = {"integrated_lufs": None, "true_peak_db": None, "loudness_range_lu": None}
+    summary = r.stderr.split("Summary:")[-1] if "Summary:" in r.stderr else ""
+    for line in summary.splitlines():
+        s = line.strip()
+        try:
+            if s.startswith("I:"):
+                out["integrated_lufs"] = float(s.split()[1])
+            elif s.startswith("LRA:"):
+                out["loudness_range_lu"] = float(s.split()[1])
+            elif s.startswith("Peak:") and "True peak" not in s and "dBTP" in s:
+                out["true_peak_db"] = float(s.split()[1])
+        except (IndexError, ValueError):
+            continue
+    # 有的 ffmpeg 版本 true peak 行形如 “    Peak:   -1.5 dBFS”
+    for line in summary.splitlines():
+        if line.strip().startswith("Peak:") and out["true_peak_db"] is None:
+            try:
+                out["true_peak_db"] = float(line.split("Peak:")[1].split("dB")[0].strip())
+            except (IndexError, ValueError):
+                pass
+    return out
+
+
+def _scene_cuts(path: Path, threshold: float = 0.25) -> List[float]:
+    """ffmpeg scene 检测的镜头切点（秒，去掉 0）。需要 ffmpeg；返回 [] 表示没检测到或只有一个镜头。"""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+                        "-vf", f"select='gt(scene,{threshold})',showinfo", "-an", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    cuts = []
+    for line in r.stderr.splitlines():
+        m = re.search(r"pts_time:([0-9.]+)", line)
+        if m:
+            cuts.append(float(m.group(1)))
+    return sorted(round(t, 3) for t in cuts if t > 0.2)
+
+
+def _read_timeline(path: Path) -> Optional[List[Dict[str, Any]]]:
+    """逐句旁白时间轴（[{start,end,text?}]）。读不到返回 None，不报错（不强制每个项目都有）。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    rows = []
+    for x in data:
+        if isinstance(x, dict) and isinstance(x.get("start"), (int, float)) and isinstance(x.get("end"), (int, float)):
+            rows.append({"start": float(x["start"]), "end": float(x["end"]), "text": x.get("text", "")})
+    return rows or None
+
+
+def _shot_alignment(cuts: List[float], timeline: List[Dict[str, Any]], tolerance: float = 1.2) -> Dict[str, Any]:
+    """
+    声画对齐启发式：第 2 句起每个旁白起点应在某个镜头切点 ±tolerance 内（首个镜头 0s 不算切点）。
+    错位边界占多数（≥一半且至少 2 个）判错；切点或时间轴为空不判。
+    """
+    bounds = [round(float(x["start"]), 3) for x in timeline[1:]]
+    if not cuts or len(bounds) < 2:
+        return {"checked": False, "reason": "镜头切点或旁白边界不足，跳过对齐检查"}
+    misses = [b for b in bounds if all(abs(b - c) > tolerance for c in cuts)]
+    return {"checked": True, "tolerance_s": tolerance, "shot_cuts": cuts, "speech_bounds": bounds,
+            "misses": misses, "miss_ratio": round(len(misses) / len(bounds), 3),
+            "aligned": len(misses) < max(2, len(bounds) / 2)}
+
+
 def cmd_master_check(a) -> Dict[str, Any]:
     pol = load_policy()
     path = Path(a.master)
@@ -421,15 +491,111 @@ def cmd_master_check(a) -> Dict[str, Any]:
     for k, d in durs.items():
         if abs(d - target) > pol["tolerance"]:
             errs.append(f"{k} 时长 {d:.3f}s 与目标 {target}s 相差超过 {pol['tolerance']}s")
-    mv = _mean_volume(path) if au else None
-    if mv is not None and mv < a.min_mean_db:
-        errs.append(f"整体响度 {mv:.1f}dB 低于 {a.min_mean_db}dB，手机外放会听不清")
+    # 响度：优先 EBU R128（integrated LUFS / true peak），没有 ebur128 时回退 mean_volume
+    loud: Dict[str, Any] = {}
+    if au:
+        loud = _loudness(path)
+    i_lufs = loud.get("integrated_lufs")
+    tp = loud.get("true_peak_db")
+    mv = _mean_volume(path) if au and i_lufs is None else None
+    loudness_mode = "ebu_r128" if i_lufs is not None else ("mean_volume_fallback" if mv is not None else "unavailable")
+    if i_lufs is not None and i_lufs < a.min_lufs:
+        errs.append(f"整体响度 {i_lufs:.1f} LUFS 低于 {a.min_lufs:.0f} LUFS，手机外放会听不清")
+    elif mv is not None and mv < a.min_mean_db:
+        errs.append(f"整体响度 {mv:.1f}dB 低于 {a.min_mean_db}dB（ebur128 不可用，回退均值判定），手机外放会听不清")
+    if tp is not None and tp > a.max_tp:
+        errs.append(f"真峰值 {tp:.1f} dBTP 超过 {a.max_tp:.1f} dBTP，有削波风险")
+    # 声画对齐：镜头切点与逐句旁白边界比对（启发式；没有时间轴/切点不足时不拦）
+    alignment: Dict[str, Any] = {"checked": False}
+    if v and a.timeline:
+        timeline = _read_timeline(Path(a.timeline))
+        if timeline is None:
+            raise FlowError(f"逐句时间轴读不出（需要 start/end JSON 列表）: {a.timeline}")
+        alignment = _shot_alignment(_scene_cuts(path, threshold=a.scene_threshold), timeline,
+                                    tolerance=a.align_tolerance)
+        if alignment.get("checked") and not alignment.get("aligned"):
+            warns.append(
+                f"声画可能错位：{len(alignment['misses'])}/{len(alignment['speech_bounds'])} 句旁白起点附近 "
+                f"±{a.align_tolerance}s 没有镜头切换，miss={alignment['misses']}；"
+                "优先用原片重剪对轴（不要重新生成），确认无误可忽略")
     if errs:
         raise FlowError("；".join(errs))
-    if mv is not None and mv > -10:
+    if i_lufs is not None and i_lufs > -9:
+        warns.append(f"响度 {i_lufs:.1f} LUFS 偏大，注意削波")
+    elif mv is not None and mv > -10:
         warns.append(f"响度 {mv:.1f}dB 偏大，注意削波")
-    return {"ok": True, "sha256": sha256_file(path), "durations": durs, "mean_volume_db": mv, "warnings": warns,
-            "remind": "仍需人工/自动回听：旁白逐句完整、字幕不裁切、画面无伪文字"}
+    if au and loudness_mode == "mean_volume_fallback":
+        warns.append("本机 ffmpeg 无 ebur128，响度按 mean_volume 兜底；建议升级 ffmpeg")
+    return {"ok": True, "sha256": sha256_file(path), "durations": durs,
+            "loudness": {"mode": loudness_mode, "integrated_lufs": i_lufs, "true_peak_db": tp,
+                         "loudness_range_lu": loud.get("loudness_range_lu"), "mean_volume_db_fallback": mv},
+            "shot_alignment": alignment, "warnings": warns,
+            "remind": "仍需人工/自动回听：旁白逐句完整、字幕不裁切、画面无伪文字/伪品牌；声画对齐为启发式报警，不替代人工复核"}
+
+
+# ----------------------------------------------------------------------------- 发布包
+def cmd_raw_check(a) -> Dict[str, Any]:
+    """
+    原片（生成直出）核验：规格 + 镜头切点表 + 均匀抽帧拼图。
+    拼图必须人工看：伪品牌/伪文字/不可读道具文字在琴盖、信笺、门牌等高光区域最常见；
+    守卫不做 OCR（无可靠本地依赖时不误判），只把证据备好。
+    """
+    pol = load_policy()
+    raw = Path(a.raw)
+    if not raw.is_file():
+        raise FlowError(f"原片不存在: {a.raw}")
+    info = _ffprobe(raw)
+    v = [s for s in info["streams"] if s.get("codec_type") == "video"]
+    if len(v) != 1:
+        raise FlowError(f"原片需要恰好一条视频轨（实际 {len(v)}）")
+    vs = v[0]
+    w, h = int(vs["width"]), int(vs["height"])
+    dur = float(info["format"].get("duration") or 0)
+    aw, ah = (int(x) for x in pol["aspect"].split(":"))
+    spec_errs = []
+    if abs(w / h - aw / ah) > 0.03:
+        spec_errs.append(f"画幅 {w}x{h} 与 {pol['aspect']} 不符")
+    if dur > pol["max"] + pol["tolerance"]:
+        spec_errs.append(f"时长 {dur:.2f}s 超过单条上限 {pol['max']}s（应单条直出，不要拆段）")
+    fps_txt = vs.get("r_frame_rate", "24/1")
+    try:
+        num, den = fps_txt.split("/")
+        fps = float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        fps = 24.0
+    cuts = _scene_cuts(raw, threshold=a.threshold)
+    day = day_path(a.day_dir) if a.day_dir else None
+    outdir = (day / "_raw_check") if day else raw.parent / "_raw_check"
+    outdir.mkdir(parents=True, exist_ok=True)
+    n = max(2, int(a.frames))
+    # 均匀取帧（避开 0 和结尾黑帧），tile 成拼图
+    times = [round(dur * (i + 0.5) / n, 2) for i in range(n)]
+    frames_dir = outdir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frame_paths: List[Path] = []
+    for i, t in enumerate(times):
+        fp = frames_dir / f"raw_{i:02d}_{t:05.2f}s.png"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(raw),
+                        "-frames:v", "1", "-vf", f"scale={a.thumb_width}:-1", str(fp)], check=True)
+        frame_paths.append(fp)
+    cols = 4
+    rows = (n + cols - 1) // cols
+    sheet = outdir / "raw-contact-sheet.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *sum([["-i", str(p)] for p in frame_paths], []),
+                    "-filter_complex", f"tile={cols}x{rows}", str(sheet)], check=True)
+    report = {"ok": not spec_errs, "raw": rel(raw) if day else str(raw), "spec": {"width": w, "height": h,
+              "duration_s": round(dur, 3), "fps": round(fps, 3), "expected_aspect": pol["aspect"],
+              "max_seconds": pol["max"]}, "shot_cuts": cuts, "shot_count": len(cuts) + 1,
+              "sample_times_s": times, "contact_sheet": rel(sheet) if day else str(sheet),
+              "visual_review_required": ["伪品牌/logo（琴盖、标牌）", "生成文字/乱码（信笺、书页、门牌）",
+                                          "人物口型/对白", "与旁白叙事顺序是否一致"],
+              "errors": spec_errs,
+              "remind": "拼图必须人工过一遍；发现伪文字优先用裁剪/模糊/换帧在后期解决，不为此重新生成"}
+    if day:
+        write_json(day / "raw-check.json", report)
+    if spec_errs:
+        raise FlowError("；".join(spec_errs) + f"；镜头与抽帧证据已生成：{report['contact_sheet']}")
+    return report
 
 
 # ----------------------------------------------------------------------------- 发布包
@@ -684,6 +850,69 @@ def cmd_metric_add(a) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------- 状态
+# ----------------------------------------------------------------------------- 烂尾提醒
+def _stale_review_rows(at: datetime, max_hours: float = 48.0) -> List[Dict[str, Any]]:
+    """UNDER_REVIEW 超 max_hours 未复查（时间锚点：状态日志最后一条的 at；拿不到则跳过，不猜）。"""
+    rows = []
+    for d in all_day_dirs():
+        if not (d / "publish_status.json").exists():
+            continue
+        try:
+            s = load_status(d)
+        except Exception:  # noqa: BLE001
+            continue
+        for p, ps in s.get("platforms", {}).items():
+            if ps.get("state") != "UNDER_REVIEW":
+                continue
+            logs = ps.get("log") or []
+            last = None
+            for e in reversed(logs):
+                if isinstance(e, dict) and e.get("at"):
+                    try:
+                        last = parse_time(e["at"])
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
+            age_h = round((at - last).total_seconds() / 3600, 1) if last else None
+            if age_h is not None and age_h > max_hours:
+                rows.append({"day": d.name, "episode_id": s.get("episode_id"), "platform": p,
+                             "state": "UNDER_REVIEW", "age_hours": age_h,
+                             "action": "到该平台后台复查原作品（已发布则 done published；被驳回/仍在审据实记），不重新投稿"})
+    return rows
+
+
+def _pending_plan_rows(at: datetime, max_days: float = 7.0) -> List[Dict[str, Any]]:
+    """
+    已写好确认①方案（*-plan-approved.json）但超过 max_days 仍没有任何平台 PUBLISHED：
+    方案在等用户拍板，提醒别烂尾。无法读取时间时用文件修改时间。
+    """
+    rows = []
+    for d in all_day_dirs():
+        has_pub = (d / "publish_status.json").exists()
+        already_published = False
+        if has_pub:
+            try:
+                st = load_status(d)
+                already_published = any(ps.get("state") == "PUBLISHED"
+                                        for ps in (st.get("platforms") or {}).values())
+            except Exception:  # noqa: BLE001
+                pass
+        for plan in sorted(d.glob("*-plan-approved.json")):
+            if already_published:
+                continue
+            key = ""
+            try:
+                key = str((read_json(plan) or {}).get("candidate_id") or "")
+            except Exception:  # noqa: BLE001
+                pass
+            age_d = (at - datetime.fromtimestamp(plan.stat().st_mtime, tz=at.tzinfo)).total_seconds() / 86400
+            if age_d > max_days:
+                rows.append({"day": d.name, "candidate_id": key or plan.stem,
+                             "plan": rel(plan), "age_days": round(age_d, 1),
+                             "action": "确认①方案长期未批准：今天做就给用户确认①，不做就在项目记录里显式搁置，别一直挂着"})
+    return rows
+
+
 def cmd_status(a) -> Dict[str, Any]:
     days = [day_path(a.day_dir)] if a.day_dir else [d for d in all_day_dirs() if (d / "publish_status.json").exists()]
     out = {}
@@ -693,7 +922,12 @@ def cmd_status(a) -> Dict[str, Any]:
                        "platforms": {p: {k: v.get(k) for k in ("state", "post_id", "published_at")}
                                      for p, v in s.get("platforms", {}).items()}}
     due = [r for r in _window_rows(now()) if r["state"] == "due"]
-    return {"ok": True, "episodes": out, "metrics_due": due}
+    if a.day_dir:
+        reminders = []
+    else:
+        reminders = [*_stale_review_rows(now()), *_pending_plan_rows(now())]
+    return {"ok": True, "episodes": out, "metrics_due": due, "followups": reminders,
+            "followup_count": len(reminders)}
 
 
 # ----------------------------------------------------------------------------- 选题
@@ -821,7 +1055,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_gen_log)
 
     p = sp.add_parser("master-check"); p.add_argument("--master", required=True); p.add_argument("--duration", type=float)
-    p.add_argument("--min-mean-db", type=float, default=-24.0, help="整体平均响度下限，默认 -24dB"); p.set_defaults(func=cmd_master_check)
+    p.add_argument("--min-mean-db", type=float, default=-24.0, help="ebur128 不可用时的均值响度兜底下限，默认 -24dB")
+    p.add_argument("--min-lufs", type=float, default=-18.0, help="EBU R128 integrated 响度下限，默认 -18 LUFS")
+    p.add_argument("--max-tp", type=float, default=-1.0, help="真峰值上限，默认 -1 dBTP")
+    p.add_argument("--timeline", default="", help="逐句旁白时间轴 JSON（start/end 列表）；给了才做声画对齐检查")
+    p.add_argument("--align-tolerance", type=float, default=1.2, help="旁白起点与镜头切点的对齐容差（秒）")
+    p.add_argument("--scene-threshold", type=float, default=0.25, help="ffmpeg scene 检测阈值，默认 0.25")
+    p.set_defaults(func=cmd_master_check)
+
+    p = sp.add_parser("raw-check", description="原片规格+镜头切点+抽帧拼图；拼图需人工看伪品牌/伪文字")
+    p.add_argument("--raw", required=True); p.add_argument("--day-dir", default="", help="证据写到该日目录的 _raw_check/ 下")
+    p.add_argument("--frames", type=int, default=12, help="均匀抽帧数，默认 12")
+    p.add_argument("--thumb-width", type=int, default=240, help="拼图单帧宽，默认 240")
+    p.add_argument("--threshold", type=float, default=0.25, help="ffmpeg scene 检测阈值")
+    p.set_defaults(func=cmd_raw_check)
 
     p = sp.add_parser("pack-check"); p.add_argument("--day-dir", required=True)
     p.add_argument("--approved", default="", help="用户看过成片后同意发布的原话"); p.set_defaults(func=cmd_pack_check)
@@ -848,7 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READONLY_CMDS = {"status", "metrics-due", "topics", "gen-check", "master-check"}
+READONLY_CMDS = {"status", "metrics-due", "topics", "gen-check", "master-check", "raw-check"}
 
 
 def _lock():

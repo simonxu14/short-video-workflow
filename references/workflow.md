@@ -6,23 +6,27 @@
 
 | 时机 | 你做什么 | 说明 |
 |---|---|---|
-| ✋ 确认① 方案 | 看选题+脚本+生成方案，说「做」 | 一次同意 = 允许用 Seedance 2.5 生成**一次** |
+| ✋ 确认① 方案 | 看选题+脚本+生成方案，说「做」 | 一次同意 = 允许用锁定模型生成**一次** |
 | ✋ 确认② 成片 | 看成片，说「发」 | 一次同意 = 五个平台连续发布 |
-| 偶发：登录 | 扫码 | 视频号/小红书常失效 |
+| 偶发：登录 | 扫码 | 视频号/小红书常失效；发布前先做一轮登录预检 |
 | 偶发：结果不明 | 帮忙看一眼后台 | 只核查原作品，绝不重投 |
 | 偶发：要重生成 | 说「重做」 | 已生成过的候选再次生成必须你点头 |
 
-其余全部自动：选题研究、写脚本、史实自查、生成、配音字幕、成片自检、填写各平台表单、记账、截图存证、到期采数据。
+其余全部自动：选题研究、写脚本、TTS 时长实测、史实自查、生成、原片 raw-check、配音字幕、声画对轴、成片自检、填写各平台表单、记账、截图存证、到期采数据。
 
 ## 每一期的步骤
 
 ```
-0 开工   flow.py metrics-due → 有到期窗口先把往期数据采完（顺手闭环）
+0 开工   flow.py metrics-due → 有到期窗口先把往期数据采完；status 的 followups 顺手处理
 1 选题   flow.py topics 看题库参考 + 当日联网找新题 → 选 1 个最抓马、主角大众熟知的题
-2 脚本   按 references/craft.md 写：强钩子 + 单旁白 + 反转 + 主页导流；自查史实
+2 脚本   按 references/craft.md 写：强钩子 + 单旁白 + 反转 + 主页导流；
+         同款 TTS 实测旁白压到 26–27s；自查史实；指定每个画面镜头与封面帧
          ✋ 确认①（选题、脚本、画面方案、模型/时长一次给用户看）
 3 生成   flow.py gen-check → flow.py gen-start → 单次提交并静默等待 → 保存回执 → flow.py gen-log
-4 后期   配音、字幕、响度 → flow.py master-check → 语音识别回听 + 抽帧看字幕/伪文字
+         下载原片后先 flow.py raw-check --raw 原片.mp4 --day-dir D（抽帧拼图人工看伪品牌/伪文字）
+4 后期   配音（已定稿就不换）、逐句时间轴、字幕、响度；
+         发现声画错位优先按时间轴重剪原片（不重新生成）；
+         flow.py master-check --master M --timeline 时间轴.json → ASR 回听 + 抽帧自检
          ✋ 确认②（成片 + 各平台标题文案一起给用户看）
 5 发布   flow.py pack-check --approved "原话"
          每个平台：flow.py start → 现场上传填写 → 点发布 → 截图 → flow.py done
@@ -39,14 +43,15 @@
 | `gen-check --plan P` | 生成前只读检查 | 模型/拆段/画幅/批准不合规；原请求仍在提交、等待或结果未知；已成功但未批准重做 |
 | `gen-start --plan P [--regen-approved "原话"]` | 提交前原子检查并写 `submitting` 本地占位（不代表受理） | 重复占位、等待中/未知状态不能靠重做批准放行 |
 | `gen-log --plan P --status submitted\|succeeded\|failed\|unknown [--evidence E] [--url U]` | 给原请求记回执/终态；E 相对项目根 | 终态缺非空证据；成功缺结果地址；未知回退为 submitted |
-| `master-check --master M` | 成片实测 | 不是一视一音 / 时长不对 / 画幅错 / 响度低于 −24dB |
+| `raw-check --raw R [--day-dir D] [--frames 12]` | 原片规格核验 + 镜头切点表 + 均匀抽帧拼图（写 `_raw_check/`） | 画幅错、时长超单条上限；**拼图必须人工看伪品牌/伪文字** |
+| `master-check --master M [--timeline T]` | 成片实测 | 不是一视一音 / 时长不对 / 画幅错；EBU R128 integrated < −18 LUFS；true peak > −1 dBTP（无 ebur128 时回退 mean_volume < −24dB）。声画错位只**警告**不拦 |
 | `pack-check --day-dir D [--approved "原话"]` | 发布包检查+记发布批准 | 母版被改 / 缺 AI 标识 / 支持原创却没开 / 标题超限（小红书 20 字）/ 话题超限（快手 4 个）/ 占位文字 |
 | `start --day-dir D --platform X` | 开始投稿（被驳回后可再投，自动计次） | 未批准 / 已投过 / 上次结果未知 / 同一母版在别的日期投过 |
 | `done --day-dir D --platform X --result under_review\|published\|rejected\|unknown --evidence 截图 [--post-id --url --published-at]` | 记结果 | 没截图 / 已发布回退 |
 | `metrics-due` | 列出到期待采的数据窗口 | — |
 | `metric-add --day-dir D --platform X --window w24\|w48\|w7d --evidence 截图 --plays N ...` | 记数据并自动追加历史 | 没到期 / 重复采 / 全空补零 |
-| `status [--day-dir D]` | 状态总览 | — |
-| `topics` | 题库去重（跳过已做/被否）+ 历史表现打分 | — |
+| `status [--day-dir D]` | 状态总览 + `followups`（审核中超 48h、确认①方案超 7 天没下文） | — |
+| `topics` | 题库去重（跳过已做/被否）+ 历史表现打分（样本 n<3 不参与加权） | — |
 
 计划 JSON 最少需要：`candidate_id`、`prompt`、`locked_parameters`（model_version / target_duration_seconds / aspect_ratio / video_count=1 / segments_seconds=[29] / fallback_allowed=false）、`user_approval.quote`（用户同意原话）。
 
@@ -59,6 +64,13 @@
 5. **中断先冻结**：超时、消息中断、无有效回执记 `unknown`；`submitting`、`submitted`、`unknown` 均禁止再次提交，`--regen-approved` 也不能越过。按原调用、原回执、正式任务历史核查，找到原片即接续后期。仅有明确失败/未受理证据才可附证据记 `failed`；找不到链接不是失败证据。更正只追加、不抹历史，也不把本地时间当成服务端时间。
 6. **如实结束恢复**：已查入口、原始错误、仍缺的凭据分别说明；没有正式查询能力就明确限制，不猜接口、不反复提交。原请求终态核清前保持冻结。守卫只校验留痕与状态，证据真实性仍需现场核对；本次未知结果不会因升级而解除。
 
+## 声画对齐（v2.2 起机器先帮你查一遍）
+
+- 触发器：`master-check --timeline 逐句时间轴.json`。逐句时间轴就是后期做字幕用的 `[{start,end,text}]`。
+- 判定：第 2 句起每个旁白起点，±1.2s（可调）内应有镜头切点；错位边界占多数才报警。切点不足/没给时间轴 → 跳过，不拦。
+- 这是**启发式、只警告不拦截**：场景叠化、长镜头叙事会有漏报/误报，最终以人工复核为准。
+- 报警后的动作顺序：先看抽帧确认 → 能重剪解决就按时间轴重排原片镜头（不花生成额度）→ 确认是误判就照发。
+
 ## 只在真风险处拦截（这些永不放宽）
 
 - 只用 `video_production_policy.json` 指定的模型（如 seedance_2.5），不降级、不替换，≤29s 单条不拆段。
@@ -67,9 +79,11 @@
 - 发布必须有截图证据；数据到期才采、看不到就写缺失、**不补零、不编造**。
 - 登录、验证码、支付由用户亲自完成。
 
-## 平台现场要点（实测）
+## 平台现场要点
+
+完整实测手册（各平台声明位置、封面入口、时区口径、绕坑办法、视频号 shadowRoot 上传代码）见 **[platforms.md](platforms.md)**。要点：
 
 - 小红书标题 ≤20 字；快手话题 ≤4 个。
-- 视频号：上传框在 WUJIE-APP 的 shadowRoot 里，要从 shadowRoot 取 `input[type=file]`；避免点击触发系统文件选择框（会卡住浏览器自动化）。网页助手拿不到作品 ID/公开链接，用后台列表时间作发布时间即可。
-- 抖音/快手/B站无原创声明入口；小红书、视频号有，必须勾。
-- 平台后台列表时间可能按 UTC 显示，记录时换成北京时间。
+- 抖音、快手、视频号后台时间跟随运行设备时区；B站、小红书是北京时间。拿不准时区就不写 `published_at`。
+- 视频号上传用 CDP `DOM.setFileInputFiles` 注入 shadowRoot 内的 input，不点上传框。
+- 视频号「原创审核中」是原创标记审核，复查到「已声明原创」再改 PUBLISHED。

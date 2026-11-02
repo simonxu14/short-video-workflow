@@ -213,7 +213,8 @@ def test_gen_receipt_success_and_failure_recovery(proj):
 
 
 # ---------------------------------------------------------------- 成片
-def _make_video(path: Path, seconds=29, w=720, h=1280, vol="1.0"):
+def _make_video(path: Path, seconds=29, w=720, h=1280, vol="2.0"):
+    # vol=2.0：内容响度约 -16 LUFS，能过 -18 LUFS 下限；测试需要安静片时显式传 0.005
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:d={seconds}:r=24",
                     "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}", "-af", f"volume={vol}",
                     "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)], check=True)
@@ -418,3 +419,80 @@ def test_concurrent_writer_blocked(proj):
         assert run("status")[0] == 0  # 只读不受锁影响
     finally:
         fh.close()
+
+
+# ---------------------------------------------------------------- v2.2 声画/响度/烂尾
+def test_shot_alignment_logic():
+    # 6 句旁白（5 个起点边界），切点全部错开 ≥1.5s
+    tl = [{"start": 0.0, "end": 4.0}, {"start": 4.5, "end": 8.0}, {"start": 9.5, "end": 10.0},
+          {"start": 14.7, "end": 17.0}, {"start": 23.5, "end": 24.0}, {"start": 27.5, "end": 28.0}]
+    bad = F._shot_alignment([6.0, 11.0, 16.0, 25.0, 29.0], tl)
+    assert bad["checked"] and bad["aligned"] is False and len(bad["misses"]) >= 2
+    good = F._shot_alignment([4.45, 9.4, 14.6, 23.4, 27.4], tl, tolerance=0.2)
+    assert good["aligned"] is True and good["misses"] == []
+    # 数据不足不判
+    assert F._shot_alignment([5.0], tl[:2])["checked"] is False
+
+
+@ffmpeg
+def test_master_check_alignment_warns_but_passes(proj):
+    # 多镜头视频（xstack 4 段黑/红/绿/蓝各 8s），给一份全错开的时间轴：应放行但报警
+    v = proj / "multi.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=red:s=720x1280:d=8:r=24",
+                    "-f", "lavfi", "-i", "color=c=green:s=720x1280:d=8:r=24",
+                    "-f", "lavfi", "-i", "color=c=blue:s=720x1280:d=8:r=24",
+                    "-f", "lavfi", "-i", "color=c=white:s=720x1280:d=5.6:r=24",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=29", "-af", "volume=2.0",
+                    "-filter_complex", "[0:v][1:v][2:v][3:v]concat=n=4:v=1[v]",
+                    "-map", "[v]", "-map", "4:a", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(v)], check=True)
+    tl = proj / "tl.json"
+    tl.write_text(json.dumps([{"start": 0.0, "end": 4.0}, {"start": 4.4, "end": 8.0},
+                              {"start": 8.4, "end": 10.0}, {"start": 16.0, "end": 17.0},
+                              {"start": 24.5, "end": 27.0}]), encoding="utf-8")
+    code, r = run("master-check", "--master", str(v), "--timeline", str(tl), "--align-tolerance", "0.8")
+    assert code == 0 and r["shot_alignment"]["checked"]
+    assert any("声画可能错位" in w for w in r["warnings"])
+    assert r["loudness"]["integrated_lufs"] is not None
+
+
+@ffmpeg
+def test_raw_check_outputs_sheet_and_report(proj):
+    day = proj / "workspace" / "2026-11-01"; day.mkdir(parents=True)
+    raw = day / "raw.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=black:s=720x1280:d=6:r=24",
+                    "-f", "lavfi", "-i", "color=c=red:s=720x1280:d=6:r=24",
+                    "-f", "lavfi", "-i", "color=c=green:s=720x1280:d=6:r=24",
+                    "-f", "lavfi", "-i", "color=c=blue:s=720x1280:d=6:r=24",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=24",
+                    "-filter_complex", "[0:v][1:v][2:v][3:v]concat=n=4:v=1[v]",
+                    "-map", "[v]", "-map", "4:a", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(raw)], check=True)
+    code, r = run("raw-check", "--raw", str(raw), "--day-dir", str(day), "--frames", "8")
+    assert code == 0 and r["shot_count"] >= 3 and len(r["sample_times_s"]) == 8
+    assert (day / "_raw_check" / "raw-contact-sheet.png").is_file()
+    assert (day / "raw-check.json").is_file()
+
+
+def test_status_followups_stale_review_and_pending_plan(proj, monkeypatch):
+    from datetime import datetime, timedelta
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "under_review", "--evidence", "shot.png")
+    # 把最后一条日志时间改到 49 小时前
+    st = json.loads((day / "publish_status.json").read_text())
+    old = (datetime.now().astimezone() - timedelta(hours=49)).isoformat(timespec="seconds")
+    st["platforms"]["douyin"]["log"][-1]["at"] = old
+    (day / "publish_status.json").write_text(json.dumps(st, ensure_ascii=False))
+    # 一份 8 天前的确认①方案，且本期没有任何 PUBLISHED
+    plan_f = day / "cand-old-plan-approved.json"
+    plan_f.write_text(json.dumps({"candidate_id": "cand-old", "locked_parameters": {}}), encoding="utf-8")
+    import os
+    os.utime(plan_f, ((datetime.now() - timedelta(days=8)).timestamp(),) * 2)
+    code, r = run("status")
+    assert code == 0 and r["followup_count"] >= 2
+    kinds = " ".join(x.get("day", "") + x.get("candidate_id", "") + x.get("platform", "") for x in r["followups"])
+    assert "douyin" in kinds and "cand-old" in kinds

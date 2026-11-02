@@ -44,6 +44,11 @@ python3 -B flow.py init --series "我的短视频系列" --model seedance_2.5 --
 python3 -B flow.py status        # 看进度
 python3 -B flow.py metrics-due   # 先采到期的往期数据
 python3 -B flow.py topics        # 题库去重 + 历史表现打分
+
+# 原片到手：镜头切点 + 抽帧拼图（人工看伪品牌/伪文字）
+python3 -B flow.py raw-check --raw raw.mp4 --day-dir workspace/2026-11-02
+# 成片：EBU R128 响度 + 声画对齐启发式
+python3 -B flow.py master-check --master master.mp4 --timeline 逐句时间轴.json
 ```
 
 完整命令与各阶段约束见 `references/workflow.md`。
