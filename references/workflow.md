@@ -1,4 +1,12 @@
-# 短视频流水线（v2 轻量版）
+# 短视频流水线（v2.4 轻量版）
+
+## 目录
+
+- 用户介入与每期步骤
+- 命令速查与生成等待恢复
+- 声画与完整动作核验
+- 发布断点、时间与版本绑定
+- 制作与交付合同入口、硬规则及平台要点
 
 一句话：**AI 一路做到底，只在两处停下等你；其余卡点只在真出事时出现。**
 
@@ -20,7 +28,7 @@
 0 开工   flow.py metrics-due → 有到期窗口先把往期数据采完；status 的 followups 顺手处理
 1 选题   flow.py topics 看题库参考 + 当日联网找新题 → 选 1 个最抓马、主角大众熟知的题
 2 脚本   按 references/craft.md 写：强钩子 + 单旁白 + 反转 + 主页导流；
-         同款 TTS 实测旁白压到 26–27s；自查史实；指定每个画面镜头与封面帧
+         同款TTS实测＋新增停顿＋片首尾≤本期目标（timing-check），不强凑26–27s；自查史实；指定镜头与封面帧
          ✋ 确认①（选题、脚本、画面方案、模型/时长一次给用户看）
 3 生成   flow.py gen-check → flow.py gen-start → 单次提交并静默等待 → 保存回执 → flow.py gen-log
          下载原片后先 flow.py raw-check --raw 原片.mp4 --day-dir D（抽帧拼图人工看伪品牌/伪文字）
@@ -53,6 +61,9 @@
 | `metrics-due` | 列出到期待采的数据窗口 | — |
 | `metric-add --day-dir D --platform X --window w24\|w48\|w7d --evidence 截图 --plays N ...` | 记数据并自动追加历史 | 没到期 / 重复采 / 全空补零 |
 | `status [--day-dir D]` | 状态总览 + `followups`（审核中超 48h、确认①方案超 7 天没下文） | — |
+| `timing-check --manifest T` | 实测同款旁白源＋新增动作停顿/片首尾总预算 | 超时、重复停顿、无真实素材；不默认提速 |
+| `revision-check --manifest R` | 局部修改源文件哈希/规格/图层覆盖/实际核验证据绑定 | 换稿/时轴/样式/声音源、角标缺口、缺实际回看证据 |
+| `delivery-next --manifest D` | 只读给出直交/同一期限选择/转存/归档下一步 | 原始交付门禁缺失、超时不能默认选择或绕过 |
 | `topics` | 题库去重（跳过已做/被否）+ 历史表现打分（样本 n<3 不参与加权） | — |
 
 计划 JSON 最少需要：`candidate_id`、`prompt`、`locked_parameters`（model_version / target_duration_seconds / aspect_ratio / video_count=1 / segments_seconds=[29] / fallback_allowed=false）、`user_approval.quote`（用户同意原话）。
@@ -99,6 +110,8 @@
 - 已采数据后改时间须先审计纠错，不直接覆盖窗口。`metric-add`在发布时间未知时明确拒绝，不补零、不造窗口。
 
 ## 只在真风险处拦截（这些永不放宽）
+
+旁白预算、局部修改合同、及时预览及链接选择恢复见 [production-contracts.md](production-contracts.md)。三个合同检查只读，工具门禁优先；不处理或追填已发布旧视频。新方案/修改包必须挂入相应合同，检查缺口先修，不将脚本成功当作像素/听感/真实发布证明。
 
 - 只用 `video_production_policy.json` 指定的模型（如 seedance_2.5），不降级、不替换，≤配置单条时长上限不拆段。
 - 结果不明（生成或投稿）先核查，**禁止重新生成/重新投稿**；一期一平台只允许一条作品。

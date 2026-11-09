@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import math
 import re
 import shutil
 import subprocess
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 def _find_root() -> Path:
     """项目根：环境变量 FLOW_ROOT > 当前目录（含配置时）> 脚本所在目录。避免在错误目录里静默新建配置。"""
     env = os.environ.get("FLOW_ROOT")
@@ -316,6 +317,12 @@ def cmd_gen_check(a) -> Dict[str, Any]:
         errs.append(f"原生成请求仍在等待结果（{last}）：只能核查原请求，禁止重生；--regen-approved 不能越过此状态")
     elif last == "succeeded" and not (a.regen_approved or "").strip():
         errs.append(f"该候选已有生成记录（{last}）。确需重生，须带 --regen-approved \"用户同意重生的原话\"")
+    timing_manifest = plan.get("_timing_manifest")
+    if timing_manifest:
+        tp = _asset(path.parent, timing_manifest)
+        timing = cmd_timing_check(argparse.Namespace(manifest=str(tp)))
+        if read_json(tp).get("target_seconds") != f["duration"]:
+            errs.append("旁白预算目标与本次生成时长不一致")
     if errs:
         raise FlowError("；".join(errs))
     return {"ok": True, "generation_allowed": True, "key": key, "model": f["model"], "duration": f["duration"],
@@ -645,6 +652,14 @@ def _check_pack(day: Path, pack: Dict[str, Any], rules: Dict[str, Any]) -> List[
             errs.append(f"{name}：平台支持原创声明，必须启用（original_declaration 应为 {r['original_target']!r}）")
     if not pack.get("platforms"):
         errs.append("发布包没有任何平台")
+    if pack.get("_revision_manifest"):
+        try:
+            rp = _asset(day, pack["_revision_manifest"])
+            result = cmd_revision_check(argparse.Namespace(manifest=str(rp)))
+            if mp.is_file() and result["master_sha256"] != sha256_file(mp):
+                errs.append("局部修改核验不是当前发布母版")
+        except FlowError as exc:
+            errs.append(str(exc))
     return errs
 
 
@@ -1220,11 +1235,182 @@ def cmd_init(a) -> Dict[str, Any]:
             "remind": "首次发布时在各平台发布页现场确认原创声明/AI标识选项，把支持的选项原文写进 platform_rules.json"}
 
 
+# ----------------------------------------------------------------------------- 制作合同（只读，不执行媒体加工或交付）
+def _seconds(value: Any, label: str, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise FlowError(f"{label}需有限秒数")
+    if value < 0 or (positive and value == 0):
+        raise FlowError(f"{label}秒数不合规")
+    return float(value)
+
+
+def _asset(base: Path, name: str) -> Path:
+    if not isinstance(name, str) or not name:
+        raise FlowError("素材路径不能为空")
+    p = Path(name) if Path(name).is_absolute() else base / name
+    if not p.is_file() or p.stat().st_size == 0:
+        raise FlowError(f"素材不存在或为空: {name}")
+    return p
+
+
+def _coverage(ranges: List[Dict[str, Any]], duration: float) -> bool:
+    if not isinstance(ranges, list):
+        raise FlowError("图层覆盖区间需列表")
+    cursor = 0.0
+    parsed = []
+    for r in ranges:
+        start = _seconds(r.get("start"), "覆盖start")
+        end = _seconds(r.get("end"), "覆盖end", True)
+        if end <= start or end > duration + .001:
+            raise FlowError("图层覆盖区间越界或倒序")
+        parsed.append((start, end))
+    for start, end in sorted(parsed):
+        if start > cursor + .001:
+            return False
+        cursor = max(cursor, end)
+    return cursor >= duration - .001
+
+
+def cmd_timing_check(a) -> Dict[str, Any]:
+    path = Path(a.manifest)
+    m = read_json(path)
+    target = _seconds(m.get("target_seconds"), "target", True)
+    source = _asset(path.parent, m.get("source_audio"))
+    audio = _ffprobe(source)
+    if not any(x.get("codec_type") == "audio" for x in audio.get("streams", [])):
+        raise FlowError("旁白源缺音轨")
+    source_seconds = _seconds(float(audio["format"]["duration"]), "实测音频", True)
+    if not m.get("voice") or not m.get("rate"):
+        raise FlowError("必须记录实际同款voice/rate；不自动换音色或加速")
+    # 源音频自身的停顿已包括在实测时长中，只计算拟新增的停顿。
+    pauses = m.get("added_pauses", [])
+    if not isinstance(pauses, list):
+        raise FlowError("added_pauses需列表")
+    extra = 0.0
+    positions = set()
+    for p in pauses:
+        at = _seconds(p.get("after_source_second"), "停顿位置")
+        if at > source_seconds or at in positions or not p.get("reason"):
+            raise FlowError("新增停顿需唯一源时轴位置及动作/反应理由，不能重复计费时长")
+        positions.add(at)
+        extra += _seconds(p.get("seconds"), "新增停顿", True)
+    lead = _seconds(m.get("lead_seconds", 0), "lead")
+    tail = _seconds(m.get("tail_seconds", 0), "tail")
+    used = source_seconds + extra + lead + tail
+    if used > target + .001:
+        raise FlowError(f"旁白+新增停顿+片首尾 {used:.3f}s 超过 {target}s；定稿前精简，不强制提速或剪碎动作")
+    frozen = _asset(path.parent, m.get("frozen_text"))
+    return {"ok": True, "source_seconds": round(source_seconds, 3), "used_seconds": round(used, 3),
+            "remaining_seconds": round(target - used, 3), "source_sha256": sha256_file(source),
+            "frozen_text_sha256": sha256_file(frozen), "voice": m["voice"], "rate": m["rate"],
+            "remind": "不要求源旁白26–27秒；新增停顿只预算一次，最终按实测声音边界与动作校准"}
+
+
+def cmd_revision_check(a) -> Dict[str, Any]:
+    path = Path(a.manifest)
+    m = read_json(path)
+    before, after = m["before"], m["after"]
+    errors = []
+    for key in ("frozen_text", "subtitle_timeline", "subtitle_style", "voice_source"):
+        b, n = _asset(path.parent, before.get(key)), _asset(path.parent, after.get(key))
+        baseline_hash = (before.get("frozen_hashes") or {}).get(key)
+        if baseline_hash != sha256_file(b):
+            errors.append(f"修改前冻结指纹缺失或源已改变: {key}")
+        if baseline_hash != sha256_file(n):
+            errors.append(f"不变项变化: {key}")
+    baseline = _asset(path.parent, before.get("master"))
+    master = _asset(path.parent, after.get("master"))
+    bi, ai = _ffprobe(baseline), _ffprobe(master)
+    bv = next((x for x in bi["streams"] if x.get("codec_type") == "video"), None)
+    av = next((x for x in ai["streams"] if x.get("codec_type") == "video"), None)
+    if not bv or not av or not any(x.get("codec_type") == "audio" for x in ai["streams"]):
+        raise FlowError("修改前后须有视频轨，修改成片须有音轨")
+    duration = float(ai["format"]["duration"])
+    if abs(duration - float(bi["format"]["duration"])) > .08:
+        errors.append("局部修改改变总时长")
+    for key in ("width", "height", "r_frame_rate"):
+        if bv.get(key) != av.get(key):
+            errors.append(f"规格变化: {key}")
+    for layer in ("ai_label", "series_label"):
+        bl, al = before["layers"][layer], after["layers"][layer]
+        if bl.get("sha256") != sha256_file(_asset(path.parent, bl.get("asset"))):
+            errors.append(f"修改前图层冻结指纹缺失或改变: {layer}")
+        if bl.get("sha256") != sha256_file(_asset(path.parent, al.get("asset"))):
+            errors.append(f"图层素材变化: {layer}")
+        if not _coverage(al.get("coverage", []), duration):
+            errors.append(f"图层覆盖缺口: {layer}（平台声明不能替代片内图层）")
+    review = m.get("export_review") or {}
+    if review.get("master_sha256") != sha256_file(master):
+        errors.append("实际导出核验未绑定当前母版")
+    for key in ("subtitle_text_and_style", "labels_visible", "voice_complete", "protected_actions"):
+        item = review.get(key) or {}
+        evidence = item.get("evidence")
+        if item.get("passed") is not True or not evidence:
+            errors.append(f"实际回看核验缺失或未通过: {key}")
+        elif not _asset(path.parent, evidence):
+            errors.append(f"核验证据缺失: {key}")
+    if errors:
+        raise FlowError("；".join(errors))
+    return {"ok": True, "master_sha256": sha256_file(master), "duration_seconds": duration,
+            "manifest_consistent": True, "pixel_verification_by_script": False,
+            "remind": "本命令校验源资产/规格/覆盖声明/导出证据绑定，不自动看懂像素；必须实际回看插镜和接缝，不能凭清单伪造通过"}
+
+
+def cmd_delivery_next(a) -> Dict[str, Any]:
+    path = Path(a.manifest)
+    m = read_json(path)
+    origin = m.get("origin")
+    if origin not in ("generation_tool", "mediakit", "local_export"):
+        raise FlowError("origin需generation_tool/mediakit/local_export，不能改来源绕过交付门禁")
+    ref = m.get("original_ref")
+    if not isinstance(ref, str) or not ref:
+        raise FlowError("须保存真实原始产物引用，不能为补链接重新生成")
+    if origin == "local_export":
+        _asset(path.parent, ref)
+    elif not ref.startswith("https://"):
+        raise FlowError("工具原始结果引用需真实https地址")
+    if m.get("delivery_status") == "delivered":
+        return {"ok": True, "next": "archive_only_no_redelivery", "can_preview": False}
+    gate = m.get("delivery_gate")
+    if gate not in ("none", "mediakit_link_choice"):
+        raise FlowError("必须按真实工具结果标明delivery_gate")
+    hint = m.get("agent_hint") or {}
+    if hint.get("type") == "mediakit_artifact_delivery" and (origin != "mediakit" or gate != "mediakit_link_choice"):
+        raise FlowError("真实MediaKit交付提示存在，不能改来源/gate绕过确认")
+    if origin == "generation_tool" and gate != "none":
+        raise FlowError("生成工具原始结果先直交，不新增保存期限审核")
+    if gate == "mediakit_link_choice":
+        if origin != "mediakit":
+            raise FlowError("MediaKit产物不能改写成本地导出绕过门禁")
+        choice = m.get("link_choice")
+        if choice not in ("keep_24h", "transfer_7d"):
+            hint = m.get("agent_hint") or {}
+            if hint.get("type") != "mediakit_artifact_delivery" or not hint.get("arguments"):
+                raise FlowError("链接选择门禁须保留真实agent_hint，不猜确认参数")
+            return {"ok": True, "next": "resume_same_link_choice_once" if m.get("choice_status") == "timeout" else "ask_exact_agent_hint",
+                    "can_preview": False, "completion_allowed": False,
+                    "remind": "超时不是拒绝或选择；保留同一任务产物，不自动重问、不改本地卡绕过，用户续跑时恢复同一选择"}
+        if not m.get("choice_evidence"):
+            raise FlowError("选择必须有本次真实确认记录，不能用默认或历史偏好替代")
+        _asset(path.parent, m["choice_evidence"])
+        if choice == "transfer_7d" and not m.get("transferred_ref"):
+            return {"ok": True, "next": "transfer_same_artifact_then_deliver", "can_preview": False}
+        ref = m.get("transferred_ref") if choice == "transfer_7d" else ref
+        if not isinstance(ref, str) or not ref.startswith("https://"):
+            raise FlowError("转存结果须真实工具返回地址")
+    return {"ok": True, "next": "deliver_media_now_then_archive", "can_preview": True, "ref": ref,
+            "completion_allowed": False, "publication_authorized": False,
+            "remind": "按实际交付合同交付后才记delivered；预览/链接期限不授予发布，画布归档状态独立记录"}
+
+
 # ----------------------------------------------------------------------------- CLI
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="flow.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=VERSION)
     sp = ap.add_subparsers(dest="cmd", required=True)
+
+    for name, fn in (("timing-check", cmd_timing_check), ("revision-check", cmd_revision_check), ("delivery-next", cmd_delivery_next)):
+        p = sp.add_parser(name); p.add_argument("--manifest", required=True); p.set_defaults(func=fn)
 
     p = sp.add_parser("init"); p.add_argument("--series"); p.add_argument("--model"); p.add_argument("--account")
     p.add_argument("--max-seconds", type=int, default=29); p.add_argument("--aspect", default="9:16"); p.set_defaults(func=cmd_init)
@@ -1304,7 +1490,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READONLY_CMDS = {"status", "resume", "metrics-due", "topics", "gen-check", "master-check", "raw-check"}
+READONLY_CMDS = {"timing-check", "revision-check", "delivery-next", "status", "resume", "metrics-due", "topics", "gen-check", "master-check", "raw-check"}
 
 
 def _lock():
