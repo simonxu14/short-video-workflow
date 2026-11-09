@@ -3,7 +3,7 @@ name: short-video-workflow
 description: 短视频系列从选题（题库去重+历史表现打分）、脚本、AI 生成到多平台发布（抖音/快手/B站/小红书/视频号）与数据回流的轻量流水线。只在两处停下等用户确认（方案、成片），其余自动完成；自带单文件守卫 flow.py，只拦真风险（模型降级、重复生成/投稿、结果不明重投、原创/AI 声明漏开、无证据、数据提前采集或补零）。用于：做某一期短视频、全平台发布、发布后采集数据、续跑系列项目。不用于：单纯剪辑或与发布无关的一次性问答。
 ---
 
-# 短视频系列流水线（v2 轻量版）
+# 短视频系列流水线（v2.3 轻量版）
 
 `<SKILL>` = 本文件所在目录，`<项目>` = 用户的系列项目目录。命令都在 `<项目>` 根目录用 `python3 -B` 运行。
 
@@ -31,10 +31,11 @@ description: 短视频系列从选题（题库去重+历史表现打分）、脚
 2 脚本   强钩子+单旁白+反转+主页导流；同款 TTS 实测旁白 26–27s；自查史实   ✋ 确认①
 3 生成   gen-check → gen-start → 单次提交并静默等待 → 保存回执 → gen-log
          原片到手先 raw-check（抽帧拼图看伪品牌/伪文字）
-4 后期   配音不换；逐句时间轴+字幕；声画错位优先重剪原片（不重新生成）
-         master-check --timeline 时间轴.json（EBU R128 响度+对齐报警）→ ASR 回听+抽帧   ✋ 确认②
-5 发布   pack-check --approved "原话"；每平台 start → 现场发布 → 截图 → done
-6 收尾   审核中的稍后复查 done --result published（自动建 24h/48h/7d 窗口）；PROJECT_STATE 追加一条
+4 后期   配音不换；逐句时间轴+字幕；连续行动链和完整动作优先，仅修复已确认的错位
+         master-check --timeline 时间轴.json [--action-ranges 动作区间.json] → 技术QA+连续回看叙事QA   ✋ 确认②
+5 发布   pack-check --approved "明确发布原话"（绑定母版/文案/封面/账号/范围）
+         每平台先准备原表单 → checkpoint prepared → start（提交前占位）→ 提交一次 → 截图 → done
+6 收尾   审核中的稍后核查原作品；done published 无可靠发布时间留空，不用复核时间建窗口；PROJECT_STATE 追加一条
 ```
 
 ## 生成静默窗口（提交前必读）
@@ -46,6 +47,13 @@ description: 短视频系列从选题（题库去重+历史表现打分）、脚
 - **中断不重试**：超时、中断、无回执记 `unknown`；`submitting` / `submitted` / `unknown` 都不能靠重做批准直接放行。先查原始调用与正式历史入口，只有明确终态证据才可纠正记录；次数、时间和原因按实证陈述，不猜受理、扣费或失败。无恢复入口时一次说明具体阻塞。
 
 详细命令与恢复边界见 `references/workflow.md`；本地守卫不控制消息调度，也不能恢复未返回的服务端结果。
+
+## 续跑与批准边界
+
+- 优先 `resume --day-dir D` 读取原平台状态：PREPARED继续原编辑页；WAITING_AUTH交接用户并重观察；SUBMITTING/SUBMITTED/UNKNOWN只核查原结果，禁止重投。`checkpoint ready` 不会解锁未知结果。
+- 修改方向认可用 `pack-check --approved "原话" --approval-kind revision`，不授予发布；明确发布批准用publication（默认），平台范围用 `--platforms`。母版、文案、封面或账号变化使旧批准失效；已绑定原表单/投稿禁止覆盖发布包。
+- `done published` 分开记录 `published_at` 与 `verified_at`；发布时间未知可记PUBLISHED但不建精确数据窗口；可靠时间可附来源/精度/时区依据补记。不自动改历史时间、旧未知记录或已发布状态。
+- 全部PUBLISHED返回 `completed`，不再建议start；详细命令和迁移边界见 `references/workflow.md`。
 
 ## 硬规则（不放宽）
 

@@ -25,12 +25,12 @@
 3 生成   flow.py gen-check → flow.py gen-start → 单次提交并静默等待 → 保存回执 → flow.py gen-log
          下载原片后先 flow.py raw-check --raw 原片.mp4 --day-dir D（抽帧拼图人工看伪品牌/伪文字）
 4 后期   配音（已定稿就不换）、逐句时间轴、字幕、响度；
-         发现声画错位优先按时间轴重剪原片（不重新生成）；
+         先连续回看叙事因果/完整动作，确认错位后局部修复，禁止为切点报警碎切；
          flow.py master-check --master M --timeline 时间轴.json → ASR 回听 + 抽帧自检
          ✋ 确认②（成片 + 各平台标题文案一起给用户看）
 5 发布   flow.py pack-check --approved "原话"
-         每个平台：flow.py start → 现场上传填写 → 点发布 → 截图 → flow.py done
-6 收尾   审核中的平台稍后复查：flow.py done --result published（自动建 24h/48h/7d 窗口）
+         每个平台：现场准备原表单 → checkpoint prepared（截图）→ start（点击提交前）→ 原表单提交一次 → 截图 → done
+6 收尾   审核中的平台只复查原作品：done published（有可靠发布时间才建24h/48h/7d窗口）；resume确认completed
          <项目>/PROJECT_STATE.md 追加一条
 ```
 
@@ -44,10 +44,12 @@
 | `gen-start --plan P [--regen-approved "原话"]` | 提交前原子检查并写 `submitting` 本地占位（不代表受理） | 重复占位、等待中/未知状态不能靠重做批准放行 |
 | `gen-log --plan P --status submitted\|succeeded\|failed\|unknown [--evidence E] [--url U]` | 给原请求记回执/终态；E 相对项目根 | 终态缺非空证据；成功缺结果地址；未知回退为 submitted |
 | `raw-check --raw R [--day-dir D] [--frames 12]` | 原片规格核验 + 镜头切点表 + 均匀抽帧拼图（写 `_raw_check/`） | 画幅错、时长超单条上限；**拼图必须人工看伪品牌/伪文字** |
-| `master-check --master M [--timeline T]` | 成片实测 | 不是一视一音 / 时长不对 / 画幅错；EBU R128 integrated < −18 LUFS；true peak > −1 dBTP（无 ebur128 时回退 mean_volume < −24dB）。声画错位只**警告**不拦 |
-| `pack-check --day-dir D [--approved "原话"]` | 发布包检查+记发布批准 | 母版被改 / 缺 AI 标识 / 支持原创却没开 / 标题超限（小红书 20 字）/ 话题超限（快手 4 个）/ 占位文字 |
-| `start --day-dir D --platform X` | 开始投稿（被驳回后可再投，自动计次） | 未批准 / 已投过 / 上次结果未知 / 同一母版在别的日期投过 |
-| `done --day-dir D --platform X --result under_review\|published\|rejected\|unknown --evidence 截图 [--post-id --url --published-at]` | 记结果 | 没截图 / 已发布回退 |
+| `master-check --master M [--timeline T] [--action-ranges A]` | 技术实测+句界切点接近度，完整动作区间多句不强切 | 规格/响度真风险；不判断语义，不强制逐句切镜 |
+| `pack-check --day-dir D [--approved "发布原话"] [--platforms X ...]` | 检查发布包、绑定当前版本/范围批准 | 内容变化失效旧批准；已有原表单/投稿禁止换包覆盖 |
+| `checkpoint --day-dir D --platform X --stage prepared\|waiting_auth\|ready --evidence E` | 保存准备/验证现场检查点，不计新投稿 | 无截图；未知投稿不得改PREPARED解锁 |
+| `resume --day-dir D [--platform X]` | 只读给出原编辑页/验证/原结果/完成的下一步 | 不自动重传/重投 |
+| `start --day-dir D --platform X` | 提交前原子占位，后仅提交原表单一次 | 缺当前版本/范围批准；待验证；已有/未知投稿；跨日重复 |
+| `done --day-dir D --platform X --result submitted\|under_review\|published\|rejected\|unknown --evidence E [--published-at ISO]` | 原请求推进，核验时间与发布时间分开 | 无证据；已发布回退；已有受理不能退回未提交 |
 | `metrics-due` | 列出到期待采的数据窗口 | — |
 | `metric-add --day-dir D --platform X --window w24\|w48\|w7d --evidence 截图 --plays N ...` | 记数据并自动追加历史 | 没到期 / 重复采 / 全空补零 |
 | `status [--day-dir D]` | 状态总览 + `followups`（审核中超 48h、确认①方案超 7 天没下文） | — |
@@ -64,16 +66,41 @@
 5. **中断先冻结**：超时、消息中断、无有效回执记 `unknown`；`submitting`、`submitted`、`unknown` 均禁止再次提交，`--regen-approved` 也不能越过。按原调用、原回执、正式任务历史核查，找到原片即接续后期。仅有明确失败/未受理证据才可附证据记 `failed`；找不到链接不是失败证据。更正只追加、不抹历史，也不把本地时间当成服务端时间。
 6. **如实结束恢复**：已查入口、原始错误、仍缺的凭据分别说明；没有正式查询能力就明确限制，不猜接口、不反复提交。原请求终态核清前保持冻结。守卫只校验留痕与状态，证据真实性仍需现场核对；本次未知结果不会因升级而解除。
 
-## 声画对齐（v2.2 起机器先帮你查一遍）
+## 声画与完整动作核验
 
-- 触发器：`master-check --timeline 逐句时间轴.json`。逐句时间轴就是后期做字幕用的 `[{start,end,text}]`。
-- 判定：第 2 句起每个旁白起点，±1.2s（可调）内应有镜头切点；错位边界占多数才报警。切点不足/没给时间轴 → 跳过，不拦。
-- 这是**启发式、只警告不拦截**：场景叠化、长镜头叙事会有漏报/误报，最终以人工复核为准。
-- 报警后的动作顺序：先看抽帧确认 → 能重剪解决就按时间轴重排原片镜头（不花生成额度）→ 确认是误判就照发。
+- `master-check --timeline T [--action-ranges A]` 统计句界与切点接近度，不验证语义；`cut_proximity_ok=true` 不能写成“声画已对齐”。
+- `A` 为实测完整动作区间 `[{"start":12.708,"end":21.417}]`；内部可容纳多句旁白，不要求切镜。内部检出切点仅提示连续回看，不自动修剪。
+- 连续回看消息→反应→行动→结果；核验人物/道具状态不倒退、每镜新增信息、高潮完整。只修实际确认的错位，禁止为消警重排/循环/碎切。
+
+## 发布断点、时间与版本绑定（v2.3）
+
+### 命令及恢复动作
+
+- `checkpoint --day-dir D --platform X --stage prepared --evidence E --editor-url HTTPS`：现场确认表单、账号、当前视频、封面、文案、声明与可见范围；记PREPARED，不增加attempts。保存非认证编辑页地址，不存含凭据链接。
+- 登录/验证码交接：按浏览器Skill完成必要交接，随后 `checkpoint --stage waiting_auth --evidence E`；返回后重新观察，通过才记 `--stage ready`。此检查点不覆盖投稿状态，也不解锁SUBMITTING/SUBMITTED/UNKNOWN。
+- 只在原表单已准备、授权与必要交接都完成后执行 `start`，本地占位成功后点击提交**一次**；受理回执用 `done --result submitted --evidence E`，审核/发布终态再据实推进。仅本地占位不证明服务端受理。
+- `resume --day-dir D [--platform X]` 只读返回每平台state、checkpoint、attempts、editor_url和next；不重新上传，不重新start。PREPARED先观察原编辑页再提交；SUBMITTING/SUBMITTED/UNKNOWN只查原结果；UNDER_REVIEW查原作品；PUBLISHED返回completed。
+- 旧SUBMITTING/UNKNOWN不自动迁成PREPARED；明确证据证明未提交才可 `done --result not_submitted --evidence E --note 依据`，不能凭超时解锁。已有受理/审核记录禁止退回未提交。已发布不可回退。
+
+### 发布批准与内容版本
+
+- `pack-check --approved "明确发布原话" [--platforms douyin ...]` 将publication批准绑定真实母版SHA256、封面、账号、该范围各平台文案和范围本身；省略范围=当前发布包全部平台。内部 `_` 前缀备注不参与指纹。
+- 用户只是认可局部修改方向：用 `--approval-kind revision` 留档，不授予新发布批准。代码不识别自然语言语义，执行者必须按真实用户意图选kind/range，不把“认可”强填publication。
+- 未开始原表单/投稿时，母版/文案/封面/账号/范围变化使旧批准归档失效；更新发布包并重新交付当前版本后，才可登记本次明确发布批准。
+- 已PREPARED/SUBMITTING/SUBMITTED/UNKNOWN/UNDER_REVIEW/PUBLISHED时不得改发布包覆盖原绑定；取消未提交准备需现场证据，已投稿只核查原作品，已发布不因换版重新放行。
+- 旧批准没有版本指纹：作为历史保留，不自动补造成有效新授权；需要新外发时重新取得当前版本批准。升级不修改既有发布状态/次数/证据。
+- 全部PUBLISHED时 `pack-check/status/resume` 返回completed，不再建议start。
+
+### 可靠发布时间
+
+- `done --result published --evidence E` 可记录后台已发布，但发布时间缺失时保留null、不建窗口；`verified_at`仅为本次核验记录时间。
+- 有可靠时间时补 `--published-at ISO8601带时区 --time-source platform_backend|public_page|verified_receipt --time-precision minute|second|unknown --timezone-basis "核定依据"`。
+- 后台只到分钟时00秒是规范化值，不宣称秒级精度；时区未核定不填写时间。复查不改旧发布时间，v1状态转换事件的at也不当发布时间。
+- 已采数据后改时间须先审计纠错，不直接覆盖窗口。`metric-add`在发布时间未知时明确拒绝，不补零、不造窗口。
 
 ## 只在真风险处拦截（这些永不放宽）
 
-- 只用 `video_production_policy.json` 指定的模型（如 seedance_2.5），不降级、不替换，≤29s 单条不拆段。
+- 只用 `video_production_policy.json` 指定的模型（如 seedance_2.5），不降级、不替换，≤配置单条时长上限不拆段。
 - 结果不明（生成或投稿）先核查，**禁止重新生成/重新投稿**；一期一平台只允许一条作品。
 - 平台支持原创声明就必须开；AI 标识必须开。
 - 发布必须有截图证据；数据到期才采、看不到就写缺失、**不补零、不编造**。

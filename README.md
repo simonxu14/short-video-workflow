@@ -19,7 +19,7 @@ short-video-workflow/
 │   └── flow.py           # 唯一守卫脚本（零第三方依赖，Python 3.9+）
 └── tests/
     ├── pytest.ini
-    └── test_flow.py      # 32 个守卫测试
+    └── test_flow.py      # 守卫及恢复回归测试
 ```
 
 ## 适合做什么
@@ -47,11 +47,13 @@ python3 -B flow.py topics        # 题库去重 + 历史表现打分
 
 # 原片到手：镜头切点 + 抽帧拼图（人工看伪品牌/伪文字）
 python3 -B flow.py raw-check --raw raw.mp4 --day-dir workspace/2026-11-02
-# 成片：EBU R128 响度 + 声画对齐启发式
+# 成片：EBU R128 响度 + 句界切点接近度（不证明语义对齐）
 python3 -B flow.py master-check --master master.mp4 --timeline 逐句时间轴.json
 ```
 
 完整命令与各阶段约束见 `references/workflow.md`。
+
+v2.3 将画面按连续行动链组织，保护完整动作；将表单准备/验证检查点与投稿状态分开，`resume`只核查原现场。发布批准绑定母版、封面、文案、账号和范围；旧未绑定批准不自动用于新外发。发布时间不明可记后台已发布，但不拿复核时间建立数据窗口。升级保留旧状态/次数/证据，不自动解锁或重投。
 
 ## 核心规则（不可放宽）
 

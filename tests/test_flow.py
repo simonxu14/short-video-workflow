@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent / "scripts"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent / "scripts" if (HERE.parent / "scripts" / "flow.py").is_file() else HERE
 sys.path.insert(0, str(ROOT))
 import flow as F  # noqa: E402
 
@@ -322,10 +323,12 @@ def test_no_post_id_still_opens_windows(proj):
     day, _ = _day(proj, platforms=("douyin",))
     run("pack-check", "--day-dir", str(day), "--approved", "发吧")
     run("start", "--day-dir", str(day), "--platform", "douyin")
-    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    pub = "2026-11-01T12:30:00+08:00"
+    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png", "--published-at", pub, "--time-precision", "minute")
     assert code == 0 and "warning" in r
     st = json.loads((day / "publish_status.json").read_text())["platforms"]["douyin"]
     assert set(st["windows"]) == {"w24", "w48", "w7d"}
+    assert st["published_time"]["precision"] == "minute"
 
 
 def test_cross_day_duplicate_master_blocked(proj):
@@ -427,9 +430,9 @@ def test_shot_alignment_logic():
     tl = [{"start": 0.0, "end": 4.0}, {"start": 4.5, "end": 8.0}, {"start": 9.5, "end": 10.0},
           {"start": 14.7, "end": 17.0}, {"start": 23.5, "end": 24.0}, {"start": 27.5, "end": 28.0}]
     bad = F._shot_alignment([6.0, 11.0, 16.0, 25.0, 29.0], tl)
-    assert bad["checked"] and bad["aligned"] is False and len(bad["misses"]) >= 2
+    assert bad["checked"] and bad["cut_proximity_ok"] is False and len(bad["misses"]) >= 2
     good = F._shot_alignment([4.45, 9.4, 14.6, 23.4, 27.4], tl, tolerance=0.2)
-    assert good["aligned"] is True and good["misses"] == []
+    assert good["cut_proximity_ok"] is True and good["misses"] == []
     # 数据不足不判
     assert F._shot_alignment([5.0], tl[:2])["checked"] is False
 
@@ -453,7 +456,7 @@ def test_master_check_alignment_warns_but_passes(proj):
                               {"start": 24.5, "end": 27.0}]), encoding="utf-8")
     code, r = run("master-check", "--master", str(v), "--timeline", str(tl), "--align-tolerance", "0.8")
     assert code == 0 and r["shot_alignment"]["checked"]
-    assert any("声画可能错位" in w for w in r["warnings"])
+    assert any("句界/切点接近度提示" in w for w in r["warnings"])
     assert r["loudness"]["integrated_lufs"] is not None
 
 
@@ -496,3 +499,183 @@ def test_status_followups_stale_review_and_pending_plan(proj, monkeypatch):
     assert code == 0 and r["followup_count"] >= 2
     kinds = " ".join(x.get("day", "") + x.get("candidate_id", "") + x.get("platform", "") for x in r["followups"])
     assert "douyin" in kinds and "cand-old" in kinds
+
+
+# ---------------------------------------------------------------- v2.3 时间、断点和批准版本
+
+def test_unknown_publish_time_never_uses_verification_time(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发吧")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    code, r = run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    assert code == 0 and r["published_at"] is None and r["verified_at"]
+    ps = F.load_status(day)["platforms"]["douyin"]
+    assert "windows" not in ps and not run("metrics-due")[1]["due"]
+    code, r = run("metric-add", "--day-dir", str(day), "--platform", "douyin", "--window", "w24", "--evidence", "shot.png", "--plays", "1")
+    assert code == 2 and "发布时间未知" in r["error"]
+    pub = "2026-11-01T12:30:00+08:00"
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--published-at", pub)[0] == 0
+    assert F.load_status(day)["platforms"]["douyin"]["windows"]["w24"]["due_at"] == "2026-11-02T12:30:00+08:00"
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published")[1]["published_at"] == pub
+
+
+def test_v1_event_time_is_not_publication_time():
+    v = {"events": [{"to": "PUBLIC_VERIFIED", "at": "2026-11-09T12:00:00+08:00"}]}
+    assert F._v1_published_at(v) is None
+
+
+def test_invalid_publish_time_writes_nothing(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    before = (day / "publish_status.json").read_bytes()
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png", "--published-at", "2026-11-01T12:00:00")[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before
+
+
+def test_prepared_auth_resume_does_not_increment_attempts(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    args = ("checkpoint", "--day-dir", str(day), "--platform", "douyin", "--evidence", "shot.png")
+    assert run(*args, "--stage", "prepared", "--editor-url", "https://creator.douyin.com/post/video")[1]["attempts"] == 0
+    assert run(*args, "--stage", "waiting_auth")[1]["next"] == "handoff_auth_then_observe_original"
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+    assert run(*args, "--stage", "ready")[0] == 0
+    before = (day / "publish_status.json").read_bytes()
+    assert run("resume", "--day-dir", str(day))[1]["platforms"]["douyin"]["next"] == "observe_original_editor_then_start_once"
+    assert (day / "publish_status.json").read_bytes() == before
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[1]["attempt"] == 1
+    run(*args, "--stage", "waiting_auth")
+    run(*args, "--stage", "ready")
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+    assert F.load_status(day)["platforms"]["douyin"]["attempts"] == 1
+
+
+@pytest.mark.parametrize("state", ["SUBMITTING", "SUBMITTED", "UNKNOWN"])
+def test_old_unresolved_states_not_unlocked_by_checkpoint(proj, state):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    s = F.load_status(day); s["platforms"]["douyin"]["state"] = state; F.save_status(day, s)
+    assert run("checkpoint", "--day-dir", str(day), "--platform", "douyin", "--stage", "prepared", "--evidence", "shot.png")[0] == 2
+    assert run("checkpoint", "--day-dir", str(day), "--platform", "douyin", "--stage", "ready", "--evidence", "shot.png")[0] == 0
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+    assert run("resume", "--day-dir", str(day))[1]["platforms"]["douyin"]["next"] == "verify_original_result_no_resubmit"
+
+
+def test_submitted_receipt_blocks_resubmit(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "submitted")[0] == 2
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "submitted", "--evidence", "shot.png")[0] == 0
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "not_submitted", "--evidence", "shot.png")[0] == 2
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+@pytest.mark.parametrize("field", ["master", "description", "title", "topics", "cover", "account", "scope"])
+def test_content_change_invalidates_old_approval(proj, field):
+    day, pk = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    if field == "master":
+        (day / "m.mp4").write_bytes(b"new-master"); pk["master"]["sha256"] = F.sha256_file(day / "m.mp4")
+    elif field == "cover":
+        (day / "c.jpg").write_bytes(b"new-cover")
+    elif field == "account":
+        pk["account_display_name"] = "另一个号"
+    elif field == "scope":
+        pk["platforms"]["kuaishou"] = dict(pk["platforms"]["douyin"])
+    else:
+        pk["platforms"]["douyin"][field] = ["#新题"] if field == "topics" else "新文案"
+    _write_pack(day, pk)
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+    code, r = run("pack-check", "--day-dir", str(day))
+    assert code == 0 and r["release_approved"] is False
+    assert F.load_status(day)["approval_history"]
+    assert run("pack-check", "--day-dir", str(day), "--approved", "发布新版")[1]["release_approved"]
+
+
+def test_revision_ack_does_not_authorize_publish_and_scope_is_enforced(proj):
+    day, pk = _day(proj)
+    r = run("pack-check", "--day-dir", str(day), "--approved", "认可", "--approval-kind", "revision")[1]
+    assert not r["release_approved"]
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+    run("pack-check", "--day-dir", str(day), "--approved", "只发抖音", "--platforms", "douyin")
+    assert run("start", "--day-dir", str(day), "--platform", "kuaishou")[0] == 2
+    pk["platforms"]["douyin"]["_plan_note"] = "内部备注改变"; _write_pack(day, pk)
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 0
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "SUBMITTING", "SUBMITTED", "UNKNOWN", "UNDER_REVIEW", "PUBLISHED"])
+def test_active_original_pack_cannot_be_overwritten(proj, state):
+    day, pk = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    s = F.load_status(day); s["platforms"]["douyin"]["state"] = state; F.save_status(day, s)
+    before = (day / "publish_status.json").read_bytes()
+    (day / "m.mp4").write_bytes(b"new-master"); pk["master"]["sha256"] = F.sha256_file(day / "m.mp4"); _write_pack(day, pk)
+    assert run("pack-check", "--day-dir", str(day), "--approved", "发新版")[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+def test_completed_status_does_not_recommend_start_or_mutate_history(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    before = (day / "publish_status.json").read_bytes()
+    assert run("status", "--day-dir", str(day))[1]["episodes"][day.name]["next"] == "completed"
+    assert run("resume", "--day-dir", str(day))[1]["platforms"]["douyin"]["next"] == "completed"
+    assert (day / "publish_status.json").read_bytes() == before
+    assert run("pack-check", "--day-dir", str(day))[1]["next"] == "completed"
+    for result in ("unknown", "rejected", "under_review", "not_submitted"):
+        assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", result, "--evidence", "shot.png")[0] == 2
+
+
+def test_long_action_exempts_sentence_cuts_but_never_proves_semantics():
+    tl = [{"start": t, "end": t + .7} for t in (0, 5.3, 7.8, 13.9, 14.4, 15.3, 17.9, 18.8, 21.6, 26.2)]
+    r = F._shot_alignment([5.292, 7.833, 12.708, 21.417, 26.208], tl,
+                          action_ranges=[{"start": 12.708, "end": 21.417}])
+    assert r["cut_proximity_ok"] and len(r["exempt_action_bounds"]) == 5
+    assert r["semantic_alignment_verified"] is False and r["action_internal_cuts"] == []
+    cut = F._shot_alignment([15.0], tl, action_ranges=[{"start": 12.708, "end": 21.417}])
+    assert cut["action_internal_cuts"] == [15.0]
+    with pytest.raises(F.FlowError):
+        F._shot_alignment([], tl, action_ranges=[{"start": 2, "end": 1}])
+
+
+@pytest.mark.parametrize("url", ["https://user:secret@example.test/editor", "https://example.test/editor?token=secret", "https://example.test/editor#secret"])
+def test_checkpoint_rejects_potential_auth_urls(proj, url):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    before = (day / "publish_status.json").read_bytes()
+    assert run("checkpoint", "--day-dir", str(day), "--platform", "douyin", "--stage", "prepared", "--evidence", "shot.png", "--editor-url", url)[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before
+
+
+def test_submitted_unknown_cannot_be_reset_and_legacy_approval_not_rebound(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "submitted", "--evidence", "shot.png")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "unknown")
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "not_submitted", "--evidence", "shot.png")[0] == 2
+    s = F.load_status(day); s["approval"] = {"quote": "发", "at": "2026-11-01T00:00:00+08:00"}; F.save_status(day, s)
+    before = (day / "publish_status.json").read_bytes()
+    assert not run("status", "--day-dir", str(day))[1]["episodes"][day.name]["release_approved"]
+    assert (day / "publish_status.json").read_bytes() == before
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+def test_time_correction_with_metrics_and_resolved_blocker(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    s = F.load_status(day); s["platforms"]["douyin"]["blocker"] = "旧登录阻塞"; F.save_status(day, s)
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png", "--published-at", "2026-11-01T00:00:00+08:00")
+    ps = F.load_status(day)["platforms"]["douyin"]
+    assert "blocker" not in ps and any("旧登录阻塞" in e["note"] for e in ps["log"])
+    s = F.load_status(day); s["platforms"]["douyin"]["metrics"] = {"w24": {"validity": "VALID"}}; F.save_status(day, s)
+    before = (day / "publish_status.json").read_bytes()
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--published-at", "2026-11-01T01:00:00+08:00")[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before

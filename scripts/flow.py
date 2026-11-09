@@ -32,8 +32,9 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 def _find_root() -> Path:
     """项目根：环境变量 FLOW_ROOT > 当前目录（含配置时）> 脚本所在目录。避免在错误目录里静默新建配置。"""
     env = os.environ.get("FLOW_ROOT")
@@ -176,10 +177,7 @@ def _v1_published_at(v: Dict[str, Any]) -> Optional[str]:
     for att in reversed(v.get("attempts", []) or []):
         if att.get("platform_published_at"):
             return att["platform_published_at"]
-    for e in v.get("events", []):
-        if e.get("to") in ("PUBLISHED_BACKEND", "PUBLIC_VERIFIED"):
-            return e.get("at")
-    return None
+    return None  # 状态转换/复核事件时间不是平台发布时间，不能拿来建数据窗口
 
 
 def convert_v1(s: Dict[str, Any]) -> Dict[str, Any]:
@@ -453,18 +451,25 @@ def _read_timeline(path: Path) -> Optional[List[Dict[str, Any]]]:
     return rows or None
 
 
-def _shot_alignment(cuts: List[float], timeline: List[Dict[str, Any]], tolerance: float = 1.2) -> Dict[str, Any]:
-    """
-    声画对齐启发式：第 2 句起每个旁白起点应在某个镜头切点 ±tolerance 内（首个镜头 0s 不算切点）。
-    错位边界占多数（≥一半且至少 2 个）判错；切点或时间轴为空不判。
-    """
-    bounds = [round(float(x["start"]), 3) for x in timeline[1:]]
+def _shot_alignment(cuts: List[float], timeline: List[Dict[str, Any]], tolerance: float = 1.2,
+                    action_ranges: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """仅统计句界与切点的接近度，不判断语义对齐；完整动作区间内允许多句连续旁白。"""
+    protected = action_ranges or []
+    for x in protected:
+        if (not isinstance(x, dict) or not isinstance(x.get("start"), (int, float)) or
+                not isinstance(x.get("end"), (int, float)) or x["start"] < 0 or x["end"] <= x["start"]):
+            raise FlowError("完整动作区间需要有效 start/end（0≤start<end）")
+    all_bounds = [round(float(x["start"]), 3) for x in timeline[1:]]
+    exempt = [b for b in all_bounds if any(x["start"] < b < x["end"] for x in protected)]
+    bounds = [b for b in all_bounds if b not in exempt]
+    info = {"semantic_alignment_verified": False, "exempt_action_bounds": exempt,
+            "action_internal_cuts": [c for c in cuts if any(x["start"] < c < x["end"] for x in protected)]}
     if not cuts or len(bounds) < 2:
-        return {"checked": False, "reason": "镜头切点或旁白边界不足，跳过对齐检查"}
+        return {**info, "checked": False, "reason": "可比较切点/句界不足；语义与动作连续性仍须复核"}
     misses = [b for b in bounds if all(abs(b - c) > tolerance for c in cuts)]
-    return {"checked": True, "tolerance_s": tolerance, "shot_cuts": cuts, "speech_bounds": bounds,
+    return {**info, "checked": True, "tolerance_s": tolerance, "shot_cuts": cuts, "speech_bounds": bounds,
             "misses": misses, "miss_ratio": round(len(misses) / len(bounds), 3),
-            "aligned": len(misses) < max(2, len(bounds) / 2)}
+            "cut_proximity_ok": len(misses) < max(2, len(bounds) / 2)}
 
 
 def cmd_master_check(a) -> Dict[str, Any]:
@@ -511,13 +516,18 @@ def cmd_master_check(a) -> Dict[str, Any]:
         timeline = _read_timeline(Path(a.timeline))
         if timeline is None:
             raise FlowError(f"逐句时间轴读不出（需要 start/end JSON 列表）: {a.timeline}")
+        actions = read_json(Path(a.action_ranges)) if a.action_ranges else []
+        if not isinstance(actions, list):
+            raise FlowError("完整动作区间必须是JSON列表")
         alignment = _shot_alignment(_scene_cuts(path, threshold=a.scene_threshold), timeline,
-                                    tolerance=a.align_tolerance)
-        if alignment.get("checked") and not alignment.get("aligned"):
+                                    tolerance=a.align_tolerance, action_ranges=actions)
+        if alignment.get("checked") and not alignment.get("cut_proximity_ok"):
             warns.append(
-                f"声画可能错位：{len(alignment['misses'])}/{len(alignment['speech_bounds'])} 句旁白起点附近 "
-                f"±{a.align_tolerance}s 没有镜头切换，miss={alignment['misses']}；"
-                "优先用原片重剪对轴（不要重新生成），确认无误可忽略")
+                f"句界/切点接近度提示：{len(alignment['misses'])}/{len(alignment['speech_bounds'])} 个句界附近 "
+                f"±{a.align_tolerance}s 无切点；这不是声画语义错位证明。"
+                "先连续回看动作与因果，仅修已确认错位，禁止为消除报警碎切/重排")
+        if alignment.get("action_internal_cuts"):
+            warns.append("完整动作区间检测到切点：连续回看确认是否动作被切断或检测误差，不自动修改")
     if errs:
         raise FlowError("；".join(errs))
     if i_lufs is not None and i_lufs > -9:
@@ -638,32 +648,99 @@ def _check_pack(day: Path, pack: Dict[str, Any], rules: Dict[str, Any]) -> List[
     return errs
 
 
+def _release_binding(day: Path, pack: Dict[str, Any], scope: List[str]) -> Dict[str, Any]:
+    """只绑定会外发的内容及真实资产；忽略 _ 前缀内部备注。"""
+    def public_fields(value):
+        if isinstance(value, dict):
+            return {k: public_fields(v) for k, v in value.items() if not k.startswith("_")}
+        if isinstance(value, list):
+            return [public_fields(v) for v in value]
+        return value
+    master = dict(pack["master"])
+    master["sha256"] = sha256_file(day / master["path"])
+    cover = dict(pack.get("cover") or {})
+    cover_path = cover.get("path") or master.get("cover_path")
+    if cover_path:
+        if not (day / cover_path).is_file():
+            raise FlowError(f"封面不存在: {cover_path}")
+        cover["sha256"] = sha256_file(day / cover_path)
+    payload = {"episode_id": pack["episode_id"], "master": master, "cover": cover,
+               "account": pack.get("account_display_name") or load_rules()["account"],
+               "cta": pack.get("cta"), "scope": sorted(scope),
+               "platforms": {p: public_fields(pack["platforms"][p]) for p in sorted(scope)}}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "master_sha256": master["sha256"], "scope": sorted(scope)}
+
+
+def _approval_valid(day: Path, pack: Dict[str, Any], s: Dict[str, Any]) -> bool:
+    a = s.get("approval") or {}
+    b = a.get("binding") or {}
+    scope = b.get("scope") or []
+    if not a.get("quote") or a.get("kind") != "publication" or not scope:
+        return False  # 旧的无版本绑定批准不可用于新的外发
+    if any(p not in pack.get("platforms", {}) for p in scope):
+        return False
+    return b == _release_binding(day, pack, scope)
+
+
+def _archive_approval(s: Dict[str, Any], reason: str) -> None:
+    if s.get("approval"):
+        s.setdefault("approval_history", []).append({**s["approval"], "invalidated_at": iso(now()), "reason": reason})
+        s["approval"] = None
+
+
+def _next_release(s: Dict[str, Any], approved: bool) -> str:
+    states = [v.get("state") for v in s.get("platforms", {}).values()]
+    if states and all(x == "PUBLISHED" for x in states):
+        return "completed"
+    if any(x in ("PREPARED", "SUBMITTING", "SUBMITTED", "UNKNOWN", "UNDER_REVIEW") for x in states):
+        return "resume"
+    return "prepare" if approved else "review_current_master_and_copy"
+
+
 def cmd_pack_check(a) -> Dict[str, Any]:
     day = day_path(a.day_dir)
     pack = read_json(day / "publish_pack.json")
-    rules = load_rules()
-    errs = _check_pack(day, pack, rules)
+    errs = _check_pack(day, pack, load_rules())
     if errs:
         raise FlowError("；".join(errs))
     s = load_status(day, create=True)
     if not s:
         s = {"schema_version": "2", "episode_id": pack["episode_id"], "master": pack["master"],
-             "approval": None, "created_at": iso(now()),
-             "platforms": {p: {"state": "NOT_STARTED", "attempts": 0, "post_id": "", "public_url": "",
-                               "published_at": None, "evidence": [], "metrics": {}, "log": []}
-                           for p in pack["platforms"]}}
+             "approval": None, "created_at": iso(now()), "platforms": {}}
     elif s.get("episode_id") != pack["episode_id"]:
         raise FlowError(f"状态文件期号 {s.get('episode_id')} 与发布包 {pack['episode_id']} 不一致，期号一经使用不改")
-    s["master"] = pack["master"]
+    current = _release_binding(day, pack, list(pack["platforms"]))
+    old = s.get("pack_binding")
+    active = any(v.get("state") in ("PREPARED", "SUBMITTING", "SUBMITTED", "UNKNOWN", "UNDER_REVIEW", "PUBLISHED")
+                 for v in s.get("platforms", {}).values())
+    master_changed = bool(s.get("master", {}).get("sha256") and
+                          s["master"]["sha256"] != current["master_sha256"])
+    if active and (master_changed or (old and old != current)):
+        raise FlowError("已有原表单/投稿绑定旧版：先核查原结果，禁止更换发布包覆盖；已发布平台不可换版重投")
+    if s.get("approval") and (not _approval_valid(day, pack, s) or (old and old != current)):
+        _archive_approval(s, "发布内容变化或旧批准缺版本绑定")
+    s["master"] = {**pack["master"], "sha256": current["master_sha256"]}
+    s["pack_binding"] = current
     for p in pack["platforms"]:
         s["platforms"].setdefault(p, {"state": "NOT_STARTED", "attempts": 0, "post_id": "", "public_url": "",
                                       "published_at": None, "evidence": [], "metrics": {}, "log": []})
-    if a.approved:
-        s["approval"] = {"quote": a.approved.strip(), "at": iso(now())}
+    quote = a.approved.strip()
+    if quote:
+        if a.approval_kind == "publication":
+            scope = a.platforms or list(pack["platforms"])
+            if any(p not in pack["platforms"] for p in scope):
+                raise FlowError("批准范围包含发布包之外的平台")
+            _archive_approval(s, "由本次明确发布批准替代")
+            s["approval"] = {"quote": quote, "at": iso(now()), "kind": "publication",
+                             "binding": _release_binding(day, pack, scope)}
+        else:
+            s.setdefault("revision_approvals", []).append({"quote": quote, "at": iso(now()), "binding": current})
+    approved = _approval_valid(day, pack, s)
     save_status(day, s)
     return {"ok": True, "episode_id": pack["episode_id"], "platforms": list(pack["platforms"]),
-            "release_approved": bool(s.get("approval")),
-            "next": "start" if s.get("approval") else "把成片给用户看；用户同意发布后带 --approved \"原话\" 再跑一次"}
+            "release_approved": approved, "next": _next_release(s, approved)}
 
 
 # ----------------------------------------------------------------------------- 投稿
@@ -678,39 +755,124 @@ def _other_submissions(platform: str, master_sha: str, episode_id: str, this_day
             continue
         ps = s.get("platforms", {}).get(platform, {})
         same = (s.get("master", {}).get("sha256") == master_sha) or (s.get("episode_id") == episode_id)
-        if same and ps.get("state") in ("SUBMITTING", "UNDER_REVIEW", "PUBLISHED", "UNKNOWN"):
+        if same and ps.get("state") in ("PREPARED", "SUBMITTING", "SUBMITTED", "UNDER_REVIEW", "PUBLISHED", "UNKNOWN"):
             hits.append(f"{d.name}:{ps.get('state')}")
     return hits
+
+
+def _assert_release(day: Path, s: Dict[str, Any], platform: str) -> Dict[str, Any]:
+    pack = read_json(day / "publish_pack.json")
+    errs = _check_pack(day, pack, load_rules())
+    if errs:
+        raise FlowError("发布包已不合规：" + "；".join(errs))
+    if not _approval_valid(day, pack, s):
+        raise FlowError("还没有当前版本的发布批准（母版/文案/封面/账号变化或旧批准未绑定）：重新交付后 pack-check --approved 原话")
+    if platform not in s["approval"]["binding"]["scope"]:
+        raise FlowError("该平台不在本次发布批准范围内")
+    if s.get("pack_binding") != _release_binding(day, pack, list(pack["platforms"])):
+        raise FlowError("发布包变化，先 pack-check；禁止覆盖原表单/投稿")
+    return pack
+
+
+def _screenshot_evidence(day: Path, paths: List[str]) -> List[str]:
+    ev = []
+    for e in paths:
+        ep = Path(e) if Path(e).is_absolute() else day / e
+        if not ep.is_file() or ep.stat().st_size == 0:
+            raise FlowError(f"证据截图不存在或为空: {e}（放在当日目录）")
+        ev.append(rel(ep) if ep.parent != day else ep.name)
+    return ev
+
+
+def _resume_action(ps: Dict[str, Any]) -> str:
+    st = ps.get("state")
+    if st == "PUBLISHED":
+        return "completed"
+    if st == "UNDER_REVIEW":
+        return "verify_original_post"
+    if ps.get("checkpoint") == "WAITING_AUTH":
+        return "handoff_auth_then_observe_original"
+    if st in ("SUBMITTING", "SUBMITTED", "UNKNOWN"):
+        return "verify_original_result_no_resubmit"
+    if st == "PREPARED":
+        return "observe_original_editor_then_start_once"
+    if st == "REJECTED":
+        return "review_rejection_before_new_attempt"
+    return "prepare_after_current_release_approval"
+
+
+def cmd_resume(a) -> Dict[str, Any]:
+    s = load_status(day_path(a.day_dir))
+    return {"ok": True, "platforms": {p: {"state": ps.get("state"), "checkpoint": ps.get("checkpoint"),
+              "attempts": ps.get("attempts", 0), "editor_url": ps.get("editor_url"),
+              "next": _resume_action(ps)} for p, ps in s["platforms"].items()
+              if not a.platform or p == a.platform}}
+
+
+def cmd_checkpoint(a) -> Dict[str, Any]:
+    day = day_path(a.day_dir)
+    s = load_status(day)
+    ps = s["platforms"].get(a.platform)
+    if ps is None:
+        raise FlowError("发布包里没有该平台")
+    ev = _screenshot_evidence(day, a.evidence)
+    if not ev:
+        raise FlowError("检查点必须有本次现场截图")
+    if a.editor_url:
+        u = urlsplit(a.editor_url)
+        if u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
+            raise FlowError("编辑页地址须为无凭据/无查询参数/无片段的https地址，不保存认证链接")
+    if ps["state"] in ("PUBLISHED", "UNDER_REVIEW", "REJECTED"):
+        raise FlowError("已投稿终态/审核中不登记编辑检查点，只核查原作品")
+    if a.stage == "prepared":
+        _assert_release(day, s, a.platform)
+        if ps["state"] not in ("NOT_STARTED", "PREPARED"):
+            raise FlowError("旧SUBMITTING/UNKNOWN只能核查原结果，禁止用prepared解锁")
+        dup = _other_submissions(a.platform, s["master"].get("sha256"), s["episode_id"], day)
+        if dup:
+            raise FlowError(f"同一母版/期号在其他日期已有投稿/表单: {dup}")
+        ps["state"] = "PREPARED"
+        ps["checkpoint"] = "EDITOR_READY"
+    elif a.stage == "waiting_auth":
+        ps["checkpoint"] = "WAITING_AUTH"  # 不覆盖提交状态，验证码超时仍不能重投
+    else:
+        ps["checkpoint"] = "OBSERVED_READY"  # 用户返回后观察已通过；不解锁UNKNOWN
+    if a.editor_url:
+        ps["editor_url"] = a.editor_url
+    ps["evidence"] = list(dict.fromkeys((ps.get("evidence") or []) + ev))
+    ps["verified_at"] = iso(now())
+    ps.setdefault("log", []).append({"at": ps["verified_at"], "note": f"checkpoint={a.stage}；{a.note}"})
+    save_status(day, s)
+    return {"ok": True, "state": ps["state"], "attempts": ps.get("attempts", 0), "next": _resume_action(ps)}
 
 
 def cmd_start(a) -> Dict[str, Any]:
     day = day_path(a.day_dir)
     s = load_status(day)
-    if not s.get("approval"):
-        raise FlowError("还没有发布批准：用户看过成片同意后，pack-check --approved \"原话\"")
-    pack = read_json(day / "publish_pack.json")
-    errs = _check_pack(day, pack, load_rules())
-    if errs:
-        raise FlowError("发布包已不合规：" + "；".join(errs))
+    _assert_release(day, s, a.platform)
     ps = s["platforms"].get(a.platform)
     if ps is None:
         raise FlowError(f"发布包里没有 {a.platform}")
     st = ps["state"]
-    if st in ("SUBMITTING", "UNKNOWN"):
+    if st in ("SUBMITTING", "SUBMITTED", "UNKNOWN"):
         raise FlowError("上次投稿结果未知：先到平台后台核查原作品，用 done 记录实际结果；禁止重新投稿")
     if st in ("UNDER_REVIEW", "PUBLISHED"):
         raise FlowError(f"该平台已投稿（{st}），一期一平台只允许一条有效作品")
+    if ps.get("checkpoint") == "WAITING_AUTH":
+        raise FlowError("等待登录/验证码：用户完成后观察并登记ready，不能直接投稿")
     resubmit = st == "REJECTED"
     dup = _other_submissions(a.platform, s["master"].get("sha256"), s["episode_id"], day)
     if dup:
         raise FlowError(f"同一母版/期号已在其他日期投过该平台：{dup}")
     ps["state"] = "SUBMITTING"
+    ps["checkpoint"] = "SUBMIT_RESERVED"
     ps["attempts"] = int(ps.get("attempts", 0)) + 1
     ps["started_at"] = iso(now())
-    ps.setdefault("log", []).append({"at": ps["started_at"], "note": f"开始投稿 attempt={ps['attempts']}"})
+    ps["submission_binding"] = s["approval"]["binding"]
+    ps.setdefault("log", []).append({"at": ps["started_at"], "note": f"开始投稿 attempt={ps['attempts']}（本地占位，未证明受理）"})
     save_status(day, s)
     return {"ok": True, "platform": a.platform, "attempt": ps["attempts"], "resubmit_after_reject": resubmit,
-            "remind": "现场确认：账号、视频预览+时长、封面、原创声明、AI标识都在页面上；点发布后 done 记录结果"}
+            "remind": "输入准备与现场核验已完成后再start；仅点击原表单提交一次，然后观察并done；中断只查原结果"}
 
 
 def _due_windows(published_at: str) -> Dict[str, Dict[str, str]]:
@@ -724,39 +886,64 @@ def cmd_done(a) -> Dict[str, Any]:
     ps = s["platforms"].get(a.platform)
     if ps is None:
         raise FlowError(f"发布包里没有 {a.platform}")
-    ev = []
-    for e in a.evidence or []:
-        ep = Path(e) if Path(e).is_absolute() else day / e
-        if not ep.is_file():
-            raise FlowError(f"证据截图不存在: {e}（放在当日目录）")
-        ev.append(rel(ep) if ep.parent != day else ep.name)
+    ev = _screenshot_evidence(day, a.evidence or [])
     prev = ps["state"]
-    if prev == "NOT_STARTED" and a.result != "not_submitted":
+    if prev in ("NOT_STARTED", "PREPARED") and a.result != "not_submitted":
         raise FlowError("该平台还没 start，先 start 再投稿")
     if prev == "UNKNOWN" and not ev:
         raise FlowError("结果未知的作品要附上本次核查的后台截图（--evidence）才能改状态")
     target = {"under_review": "UNDER_REVIEW", "published": "PUBLISHED", "rejected": "REJECTED",
-              "unknown": "UNKNOWN", "not_submitted": "NOT_STARTED"}[a.result]
+              "submitted": "SUBMITTED", "unknown": "UNKNOWN", "not_submitted": "NOT_STARTED"}[a.result]
+    if target == "SUBMITTED" and (prev not in ("SUBMITTING", "SUBMITTED", "UNKNOWN") or not ev):
+        raise FlowError("已提交待核查必须附本次受理证据，不能凭编辑页截图推断受理")
+    if target == "NOT_STARTED" and (prev in ("SUBMITTED", "UNDER_REVIEW") or
+            any("→SUBMITTED" in e.get("note", "") or "→UNDER_REVIEW" in e.get("note", "") for e in ps.get("log", []))):
+        raise FlowError("已有受理/审核记录，不能回退未提交解锁重投")
     if target in ("UNDER_REVIEW", "PUBLISHED", "REJECTED") and not (ev or ps.get("evidence")):
         raise FlowError("需要至少一张后台列表/公开页截图（--evidence）")
-    if prev == "PUBLISHED" and target in ("UNDER_REVIEW", "NOT_STARTED"):
+    if prev in ("UNKNOWN", "SUBMITTING") and a.result == "not_submitted" and not ev:
+        raise FlowError("恢复未提交必须附本次原表单/原结果核查截图，超时不是未受理证据")
+    if prev == "PUBLISHED" and target != "PUBLISHED":
         raise FlowError("已发布的作品不能回退状态")
+    if a.published_at and target != "PUBLISHED":
+        raise FlowError("只有已发布结果可登记发布时间")
+    stamp = iso(now())
+    pub = iso(parse_time(a.published_at)) if a.published_at else ps.get("published_at")
+    if pub and a.published_at and ps.get("published_at") and pub != ps["published_at"] and ps.get("metrics"):
+        raise FlowError("发布时间变化会影响已采数据窗口，先审计纠错，不能直接覆盖")
     ps["state"] = target
+    ps["verified_at"] = stamp
     ps["evidence"] = list(dict.fromkeys((ps.get("evidence") or []) + ev))
     if a.post_id:
         ps["post_id"] = a.post_id
     if a.url:
         ps["public_url"] = a.url
     if target == "PUBLISHED":
-        pub = a.published_at or ps.get("published_at") or iso(now())
-        ps["published_at"] = iso(parse_time(pub))
-        ps["windows"] = _due_windows(ps["published_at"])
-    ps.setdefault("log", []).append({"at": iso(now()), "note": f"{prev}→{target}" + (f"；{a.note}" if a.note else "")})
+        ps["published_at"] = pub  # 不以核验时间兜底
+        if a.published_at:
+            if ps.get("published_time"):
+                ps.setdefault("published_time_history", []).append(ps["published_time"])
+            ps["published_time"] = {"value": pub, "source": a.time_source, "precision": a.time_precision,
+                                    "utc_offset": parse_time(pub).strftime("%z"), "timezone_basis": a.timezone_basis,
+                                    "evidence": ev or ps["evidence"], "verified_at": stamp}
+        if pub:
+            ps["windows"] = _due_windows(pub)
+        else:
+            ps.pop("windows", None)
+        ps["checkpoint"] = "BACKEND_VERIFIED"
+        blocker = ps.pop("blocker", None)
+        if blocker:
+            ps.setdefault("log", []).append({"at": stamp, "note": "已解决旧阻塞：" + str(blocker)})
+    elif target == "NOT_STARTED":
+        ps.pop("checkpoint", None)
+    ps.setdefault("log", []).append({"at": stamp, "note": f"{prev}→{target}" + (f"；{a.note}" if a.note else "")})
     save_status(day, s)
     res = {"ok": True, "platform": a.platform, "state": target, "post_id": ps.get("post_id"),
-           "published_at": ps.get("published_at")}
-    if target == "PUBLISHED" and not ps.get("post_id"):
-        res["warning"] = "没有作品ID（视频号常见）：已用后台时间建窗口，拿到分享链接后可再 done --url 补"
+           "published_at": ps.get("published_at"), "verified_at": stamp, "next": _resume_action(ps)}
+    if target == "PUBLISHED" and not pub:
+        res["warning"] = "后台已发布，但发布时间未知；不建立精确数据窗口，后续凭可靠时间证据补记"
+    elif target == "PUBLISHED" and not ps.get("post_id"):
+        res["warning"] = "没有作品ID：按已核定发布时间建窗口；取得公开链接后可补记，不等于已公开验证"
     if target == "UNKNOWN":
         res["remind"] = "结果未知：之后只能核查原作品，不可重新投稿"
     return res
@@ -800,6 +987,8 @@ def cmd_metric_add(a) -> Dict[str, Any]:
     ps = s["platforms"].get(a.platform)
     if not ps or ps.get("state") != "PUBLISHED":
         raise FlowError("只能给已发布的作品记数据")
+    if not ps.get("published_at"):
+        raise FlowError("发布时间未知，不能采精确窗口数据；先凭可靠时间证据补记")
     wins = ps.get("windows") or _due_windows(ps["published_at"])
     t = wins[a.window]
     at = now()
@@ -918,9 +1107,13 @@ def cmd_status(a) -> Dict[str, Any]:
     out = {}
     for d in days:
         s = load_status(d)
-        out[d.name] = {"episode_id": s.get("episode_id"), "release_approved": bool(s.get("approval")),
+        pack = read_json(d / "publish_pack.json", default={})
+        approved = _approval_valid(d, pack, s) if pack else False
+        out[d.name] = {"episode_id": s.get("episode_id"), "release_approved": approved,
+                       "next": _next_release(s, approved),
                        "platforms": {p: {k: v.get(k) for k in ("state", "post_id", "published_at")}
-                                     for p, v in s.get("platforms", {}).items()}}
+                                     for p, v in s.get("platforms", {}).items()},
+                       "resume_actions": {p: _resume_action(v) for p, v in s.get("platforms", {}).items()}}
     due = [r for r in _window_rows(now()) if r["state"] == "due"]
     if a.day_dir:
         reminders = []
@@ -1058,7 +1251,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-mean-db", type=float, default=-24.0, help="ebur128 不可用时的均值响度兜底下限，默认 -24dB")
     p.add_argument("--min-lufs", type=float, default=-18.0, help="EBU R128 integrated 响度下限，默认 -18 LUFS")
     p.add_argument("--max-tp", type=float, default=-1.0, help="真峰值上限，默认 -1 dBTP")
-    p.add_argument("--timeline", default="", help="逐句旁白时间轴 JSON（start/end 列表）；给了才做声画对齐检查")
+    p.add_argument("--timeline", default="", help="字幕/旁白时间轴JSON；仅统计句界切点接近度，不证明语义对齐")
+    p.add_argument("--action-ranges", default="", help="完整动作区间JSON列表[{start,end}]，内部旁白句界不要求切镜")
     p.add_argument("--align-tolerance", type=float, default=1.2, help="旁白起点与镜头切点的对齐容差（秒）")
     p.add_argument("--scene-threshold", type=float, default=0.25, help="ffmpeg scene 检测阈值，默认 0.25")
     p.set_defaults(func=cmd_master_check)
@@ -1071,16 +1265,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_raw_check)
 
     p = sp.add_parser("pack-check"); p.add_argument("--day-dir", required=True)
-    p.add_argument("--approved", default="", help="用户看过成片后同意发布的原话"); p.set_defaults(func=cmd_pack_check)
+    p.add_argument("--approved", default="", help="用户看过当前成片及文案后同意发布的原话")
+    p.add_argument("--approval-kind", choices=["publication", "revision"], default="publication", help="修改方向认可用revision，不授予外发")
+    p.add_argument("--platforms", nargs="+", choices=PLATFORMS, help="本次明确批准的平台范围；省略=发布包全部平台")
+    p.set_defaults(func=cmd_pack_check)
+
+    p = sp.add_parser("checkpoint"); p.add_argument("--day-dir", required=True)
+    p.add_argument("--platform", choices=PLATFORMS, required=True)
+    p.add_argument("--stage", choices=["prepared", "waiting_auth", "ready"], required=True)
+    p.add_argument("--evidence", nargs="+", required=True); p.add_argument("--editor-url", default="")
+    p.add_argument("--note", default=""); p.set_defaults(func=cmd_checkpoint)
+    p = sp.add_parser("resume"); p.add_argument("--day-dir", required=True)
+    p.add_argument("--platform", choices=PLATFORMS); p.set_defaults(func=cmd_resume)
 
     p = sp.add_parser("start"); p.add_argument("--day-dir", required=True); p.add_argument("--platform", choices=PLATFORMS, required=True)
     p.set_defaults(func=cmd_start)
 
     p = sp.add_parser("done"); p.add_argument("--day-dir", required=True); p.add_argument("--platform", choices=PLATFORMS, required=True)
-    p.add_argument("--result", required=True, choices=["under_review", "published", "rejected", "unknown", "not_submitted"])
+    p.add_argument("--result", required=True, choices=["under_review", "published", "rejected", "submitted", "unknown", "not_submitted"])
     p.add_argument("--evidence", nargs="*", default=[], help="当日目录下的截图文件名，可多个")
     p.add_argument("--post-id", default=""); p.add_argument("--url", default="")
-    p.add_argument("--published-at", default="", help="平台显示的发布时间（带时区）；默认现在"); p.add_argument("--note", default="")
+    p.add_argument("--published-at", default="", help="已核定平台发布时间（带时区）；省略保留旧值，没有旧值就未知，不用现在兜底")
+    p.add_argument("--time-source", default="platform_backend", choices=["platform_backend", "public_page", "verified_receipt"])
+    p.add_argument("--time-precision", default="unknown", choices=["second", "minute", "unknown"])
+    p.add_argument("--timezone-basis", default="caller_verified", help="时区核定依据；不猜测平台/设备时区")
+    p.add_argument("--note", default="")
     p.set_defaults(func=cmd_done)
 
     p = sp.add_parser("status"); p.add_argument("--day-dir", default=""); p.set_defaults(func=cmd_status)
@@ -1095,7 +1304,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READONLY_CMDS = {"status", "metrics-due", "topics", "gen-check", "master-check", "raw-check"}
+READONLY_CMDS = {"status", "resume", "metrics-due", "topics", "gen-check", "master-check", "raw-check"}
 
 
 def _lock():
