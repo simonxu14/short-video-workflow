@@ -55,6 +55,8 @@ python3 -B flow.py master-check --master master.mp4 --timeline 逐句时间轴.j
 
 v2.4 在v2.3防重复与版本批准基础上，增加同款旁白＋动作留白总预算、局部修改不变项与导出证据核验，以及交付/期限/归档分离。`timing-check`、`revision-check`、`delivery-next`都是只读辅助，详细合同见 `references/production-contracts.md`。MediaKit真实交付门禁保留，超时不默认选择、不改来源绕过；平台手册补充标签异步校验、窄视口/受控控件与实际封面核对。升级不追填旧视频、不重生成/重投。
 
+v2.4.1只补两项：平台手册澄清视频/封面上传目标及B站真实提交按钮；`issue open/resolve`记录已发现问题，全端已发布但有open问题时返回`published_pending_cleanup`。不新增每平台必填审核材料，不自动查重/删作品，不改变旧投稿状态或防重投规则。
+
 ## 核心规则（不可放宽）
 
 1. 只用配置里锁定的模型，禁止降级/替换；不超过单条时长上限就不拆段。

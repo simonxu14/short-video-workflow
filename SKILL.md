@@ -53,7 +53,7 @@ description: 短视频系列从选题（题库去重+历史表现打分）、脚
 - 优先 `resume --day-dir D` 读取原平台状态：PREPARED继续原编辑页；WAITING_AUTH交接用户并重观察；SUBMITTING/SUBMITTED/UNKNOWN只核查原结果，禁止重投。`checkpoint ready` 不会解锁未知结果。
 - 修改方向认可用 `pack-check --approved "原话" --approval-kind revision`，不授予发布；明确发布批准用publication（默认），平台范围用 `--platforms`。母版、文案、封面或账号变化使旧批准失效；已绑定原表单/投稿禁止覆盖发布包。
 - `done published` 分开记录 `published_at` 与 `verified_at`；发布时间未知可记PUBLISHED但不建精确数据窗口；可靠时间可附来源/精度/时区依据补记。不自动改历史时间、旧未知记录或已发布状态。
-- 全部PUBLISHED返回 `completed`，不再建议start；详细命令和迁移边界见 `references/workflow.md`。
+- 全部PUBLISHED且没有已记录的open问题才返回 `completed`；仍有重复稿/配置不符等问题返回 `published_pending_cleanup`（已发布、待收尾），不再建议start。用 `issue open/resolve` 据实记问题和解决证据，不自动检测/删除作品、不解锁重投；详细命令见 `references/workflow.md`。
 
 ## 制作与及时交付
 

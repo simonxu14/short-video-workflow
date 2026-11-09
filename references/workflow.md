@@ -58,6 +58,7 @@
 | `resume --day-dir D [--platform X]` | 只读给出原编辑页/验证/原结果/完成的下一步 | 不自动重传/重投 |
 | `start --day-dir D --platform X` | 提交前原子占位，后仅提交原表单一次 | 缺当前版本/范围批准；待验证；已有/未知投稿；跨日重复 |
 | `done --day-dir D --platform X --result submitted\|under_review\|published\|rejected\|unknown --evidence E [--published-at ISO]` | 原请求推进，核验时间与发布时间分开 | 无证据；已发布回退；已有受理不能退回未提交 |
+| `issue open\|resolve --day-dir D --platform X --issue-id K --note 依据 --evidence E` | 记/关闭已发现的重复稿或配置问题；不操作平台 | 缺依据/截图、关闭不存在或已关闭问题；不改投稿状态/次数/批准 |
 | `metrics-due` | 列出到期待采的数据窗口 | — |
 | `metric-add --day-dir D --platform X --window w24\|w48\|w7d --evidence 截图 --plays N ...` | 记数据并自动追加历史 | 没到期 / 重复采 / 全空补零 |
 | `status [--day-dir D]` | 状态总览 + `followups`（审核中超 48h、确认①方案超 7 天没下文） | — |
@@ -90,7 +91,7 @@
 - `checkpoint --day-dir D --platform X --stage prepared --evidence E --editor-url HTTPS`：现场确认表单、账号、当前视频、封面、文案、声明与可见范围；记PREPARED，不增加attempts。保存非认证编辑页地址，不存含凭据链接。
 - 登录/验证码交接：按浏览器Skill完成必要交接，随后 `checkpoint --stage waiting_auth --evidence E`；返回后重新观察，通过才记 `--stage ready`。此检查点不覆盖投稿状态，也不解锁SUBMITTING/SUBMITTED/UNKNOWN。
 - 只在原表单已准备、授权与必要交接都完成后执行 `start`，本地占位成功后点击提交**一次**；受理回执用 `done --result submitted --evidence E`，审核/发布终态再据实推进。仅本地占位不证明服务端受理。
-- `resume --day-dir D [--platform X]` 只读返回每平台state、checkpoint、attempts、editor_url和next；不重新上传，不重新start。PREPARED先观察原编辑页再提交；SUBMITTING/SUBMITTED/UNKNOWN只查原结果；UNDER_REVIEW查原作品；PUBLISHED返回completed。
+- `resume --day-dir D [--platform X]` 只读返回每平台state、checkpoint、attempts、editor_url、open_issues和next；不重新上传，不重新start。PREPARED先观察原编辑页再提交；SUBMITTING/SUBMITTED/UNKNOWN只查原结果；UNDER_REVIEW查原作品；PUBLISHED无open问题才返回completed，有问题返回resolve_recorded_issues_no_resubmit。
 - 旧SUBMITTING/UNKNOWN不自动迁成PREPARED；明确证据证明未提交才可 `done --result not_submitted --evidence E --note 依据`，不能凭超时解锁。已有受理/审核记录禁止退回未提交。已发布不可回退。
 
 ### 发布批准与内容版本
@@ -100,7 +101,15 @@
 - 未开始原表单/投稿时，母版/文案/封面/账号/范围变化使旧批准归档失效；更新发布包并重新交付当前版本后，才可登记本次明确发布批准。
 - 已PREPARED/SUBMITTING/SUBMITTED/UNKNOWN/UNDER_REVIEW/PUBLISHED时不得改发布包覆盖原绑定；取消未提交准备需现场证据，已投稿只核查原作品，已发布不因换版重新放行。
 - 旧批准没有版本指纹：作为历史保留，不自动补造成有效新授权；需要新外发时重新取得当前版本批准。升级不修改既有发布状态/次数/证据。
-- 全部PUBLISHED时 `pack-check/status/resume` 返回completed，不再建议start。
+- 全部PUBLISHED且无已记录的open问题时 `pack-check/status` 返回completed，不再建议start；有问题返回published_pending_cleanup（已发布、待收尾）。各平台resume也不建议重投。
+
+### 已发布与收尾分开（v2.4.1）
+
+- 只在实际发现重复稿、标题/分区/声明等配置不符时，用 `issue open --day-dir D --platform X --issue-id duplicate-post --note 现场依据 --evidence E` 记录；不新增每平台必填检查文件。不把缺作品ID/未知发布时间自动当作收尾问题。
+- 实际处理并核验后，才用同一issue-id执行 `issue resolve`，附新的核查截图与解决依据；关闭记录不代表程序删除或改好了平台作品，不自动授权删除/修改。
+- 问题存于该平台 `issues`，状态open/resolved及history保留。`done published`、重复pack-check、ready或resolve都不能清除其他open问题、回退投稿状态或解锁重投。
+- `status`在单期/全部查询中都列出open_issues与followups；不能对存在已知未解决问题的期次说“全部处理干净”。脚本仅依据记录，不识别截图内容、不检测视频重复；未记录不等于自动验证无问题。
+- 升级不迁移/重写旧发布事实、次数、时间和证据；缺issues字段的历史兼容原行为，已知问题须单独据实留痕，不从旧日志关键词自动猜。
 
 ### 可靠发布时间
 

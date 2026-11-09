@@ -679,3 +679,93 @@ def test_time_correction_with_metrics_and_resolved_blocker(proj):
     before = (day / "publish_status.json").read_bytes()
     assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--published-at", "2026-11-01T01:00:00+08:00")[0] == 2
     assert (day / "publish_status.json").read_bytes() == before
+
+
+# ---------------------------------------------------------------- v2.4.1 已发布与收尾分离
+
+def test_open_issue_prevents_completion_without_changing_publication(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    before = F.load_status(day)
+    code, result = run("issue", "open", "--day-dir", str(day), "--platform", "douyin",
+                       "--issue-id", "duplicate-post", "--note", "后台有两条同母版作品", "--evidence", "shot.png")
+    assert code == 0 and result["next"] == "resolve_recorded_issues_no_resubmit"
+    after = F.load_status(day)
+    assert before["approval"] == after["approval"] and before["pack_binding"] == after["pack_binding"]
+    assert {k: v for k, v in after["platforms"]["douyin"].items() if k != "issues"} == before["platforms"]["douyin"]
+    snapshot = (day / "publish_status.json").read_bytes()
+    for argv in (("status", "--day-dir", str(day)), ("status",)):
+        r = run(*argv)[1]
+        assert r["episodes"][day.name]["next"] == "published_pending_cleanup"
+        assert r["followups"][0]["issue_id"] == "duplicate-post"
+    assert run("resume", "--day-dir", str(day))[1]["platforms"]["douyin"]["open_issues"]
+    assert (day / "publish_status.json").read_bytes() == snapshot
+    assert run("pack-check", "--day-dir", str(day))[1]["next"] == "published_pending_cleanup"
+    assert run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published")[1]["next"] == "resolve_recorded_issues_no_resubmit"
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+def test_resolve_one_issue_keeps_others_and_does_not_unlock_resubmit(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    run("done", "--day-dir", str(day), "--platform", "douyin", "--result", "published", "--evidence", "shot.png")
+    base = ("--day-dir", str(day), "--platform", "douyin", "--note", "实际截图依据", "--evidence", "shot.png")
+    for key in ("duplicate-post", "title-mismatch"):
+        assert run("issue", "open", *base, "--issue-id", key)[0] == 0
+    assert run("issue", "resolve", *base, "--issue-id", "duplicate-post")[0] == 0
+    assert run("status", "--day-dir", str(day))[1]["episodes"][day.name]["next"] == "published_pending_cleanup"
+    assert run("issue", "resolve", *base, "--issue-id", "title-mismatch")[1]["next"] == "completed"
+    s = F.load_status(day)
+    assert s["platforms"]["douyin"]["attempts"] == 1 and s["platforms"]["douyin"]["state"] == "PUBLISHED"
+    assert [x["action"] for x in s["platforms"]["douyin"]["issues"]["duplicate-post"]["history"]] == ["open", "resolve"]
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+@pytest.mark.parametrize("state", ["SUBMITTING", "SUBMITTED", "UNKNOWN"])
+def test_issue_resolution_never_unfreezes_unknown_submission(proj, state):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    run("start", "--day-dir", str(day), "--platform", "douyin")
+    s = F.load_status(day); s["platforms"]["douyin"]["state"] = state; F.save_status(day, s)
+    base = ("--day-dir", str(day), "--platform", "douyin", "--issue-id", "copy-mismatch",
+            "--note", "实际核查依据", "--evidence", "shot.png")
+    assert run("issue", "open", *base)[0] == 0
+    assert run("issue", "resolve", *base)[1]["next"] == "verify_original_result_no_resubmit"
+    assert F.load_status(day)["platforms"]["douyin"]["state"] == state
+    assert run("start", "--day-dir", str(day), "--platform", "douyin")[0] == 2
+
+
+def test_issue_invalid_inputs_write_nothing(proj):
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    base = ("--day-dir", str(day), "--platform", "douyin")
+    before = (day / "publish_status.json").read_bytes()
+    invalid = [
+        ("resolve", "--issue-id", "missing", "--note", "未证实", "--evidence", "shot.png"),
+        ("open", "--issue-id", "../bad", "--note", "错误标识", "--evidence", "shot.png"),
+        ("open", "--issue-id", "title-mismatch", "--note", " ", "--evidence", "shot.png"),
+        ("open", "--issue-id", "title-mismatch", "--note", "缺截图", "--evidence", "missing.png"),
+    ]
+    for action, *args in invalid:
+        assert run("issue", action, *base, *args)[0] == 2
+        assert (day / "publish_status.json").read_bytes() == before
+    assert run("issue", "open", *base, "--issue-id", "title-mismatch", "--note", "记录", "--evidence", "shot.png")[0] == 0
+    assert run("issue", "resolve", *base, "--issue-id", "title-mismatch", "--note", "解决", "--evidence", "shot.png")[0] == 0
+    before = (day / "publish_status.json").read_bytes()
+    assert run("issue", "resolve", *base, "--issue-id", "title-mismatch", "--note", "重复关闭", "--evidence", "shot.png")[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before
+
+
+def test_issue_updates_respect_writer_lock(proj):
+    import fcntl
+    day, _ = _day(proj, platforms=("douyin",))
+    run("pack-check", "--day-dir", str(day), "--approved", "发")
+    before = (day / "publish_status.json").read_bytes()
+    with open(proj / "workspace" / ".flow.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        assert run("issue", "open", "--day-dir", str(day), "--platform", "douyin",
+                   "--issue-id", "duplicate-post", "--note", "记录", "--evidence", "shot.png")[0] == 2
+    assert (day / "publish_status.json").read_bytes() == before

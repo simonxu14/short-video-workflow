@@ -15,6 +15,7 @@
   pack-check      发布包检查（含原创/AI声明、标题/话题上限）并记录发布批准
   start           某平台开始投稿（查重、拦截结果不明重投）
   done            记录某平台投稿结果；可多次调用推进 审核中→已发布
+  issue           记录/关闭已发现问题；已发布但有open问题时待收尾，不操作平台
   status          单期或全部期次状态 + 到期数据窗口
   metrics-due     列出到期未采集的数据窗口
   metric-add      写入一个窗口的数据（到期才收、缺失不补零），同步追加历史
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 def _find_root() -> Path:
     """项目根：环境变量 FLOW_ROOT > 当前目录（含配置时）> 脚本所在目录。避免在错误目录里静默新建配置。"""
     env = os.environ.get("FLOW_ROOT")
@@ -705,10 +706,22 @@ def _archive_approval(s: Dict[str, Any], reason: str) -> None:
         s["approval"] = None
 
 
+def _open_issues(ps: Dict[str, Any]) -> Dict[str, Any]:
+    """仅返回人工已记录、尚未解决的问题；不自动检测平台作品。"""
+    return {key: item for key, item in (ps.get("issues") or {}).items()
+            if item.get("status") == "open"}
+
+
+def _issue_rows(s: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"platform": p, "issue_id": key, **item}
+            for p, ps in s.get("platforms", {}).items()
+            for key, item in _open_issues(ps).items()]
+
+
 def _next_release(s: Dict[str, Any], approved: bool) -> str:
     states = [v.get("state") for v in s.get("platforms", {}).values()]
     if states and all(x == "PUBLISHED" for x in states):
-        return "completed"
+        return "published_pending_cleanup" if _issue_rows(s) else "completed"
     if any(x in ("PREPARED", "SUBMITTING", "SUBMITTED", "UNKNOWN", "UNDER_REVIEW") for x in states):
         return "resume"
     return "prepare" if approved else "review_current_master_and_copy"
@@ -755,7 +768,8 @@ def cmd_pack_check(a) -> Dict[str, Any]:
     approved = _approval_valid(day, pack, s)
     save_status(day, s)
     return {"ok": True, "episode_id": pack["episode_id"], "platforms": list(pack["platforms"]),
-            "release_approved": approved, "next": _next_release(s, approved)}
+            "release_approved": approved, "next": _next_release(s, approved),
+            "open_issues": _issue_rows(s)}
 
 
 # ----------------------------------------------------------------------------- 投稿
@@ -802,7 +816,7 @@ def _screenshot_evidence(day: Path, paths: List[str]) -> List[str]:
 def _resume_action(ps: Dict[str, Any]) -> str:
     st = ps.get("state")
     if st == "PUBLISHED":
-        return "completed"
+        return "resolve_recorded_issues_no_resubmit" if _open_issues(ps) else "completed"
     if st == "UNDER_REVIEW":
         return "verify_original_post"
     if ps.get("checkpoint") == "WAITING_AUTH":
@@ -820,8 +834,43 @@ def cmd_resume(a) -> Dict[str, Any]:
     s = load_status(day_path(a.day_dir))
     return {"ok": True, "platforms": {p: {"state": ps.get("state"), "checkpoint": ps.get("checkpoint"),
               "attempts": ps.get("attempts", 0), "editor_url": ps.get("editor_url"),
-              "next": _resume_action(ps)} for p, ps in s["platforms"].items()
+              "open_issues": _open_issues(ps), "next": _resume_action(ps)} for p, ps in s["platforms"].items()
               if not a.platform or p == a.platform}}
+
+
+def cmd_issue(a) -> Dict[str, Any]:
+    """本地问题留痕/关闭，不操作平台，不更改发布状态、次数或批准。"""
+    day = day_path(a.day_dir)
+    s = load_status(day)
+    ps = s["platforms"].get(a.platform)
+    if ps is None:
+        raise FlowError("发布包里没有该平台")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", a.issue_id):
+        raise FlowError("issue-id需小写字母开头，仅含字母/数字/下划线/连字符，最长64字")
+    note = a.note.strip()
+    if not note:
+        raise FlowError("问题记录/解决必须说明本次实际观察依据（--note）")
+    ev = _screenshot_evidence(day, a.evidence)
+    if not ev:
+        raise FlowError("问题记录/解决必须附本次核查截图")
+    issues = ps.get("issues") or {}
+    old = issues.get(a.issue_id)
+    if a.action == "resolve" and (not old or old.get("status") != "open"):
+        raise FlowError("只能关闭已记录且仍open的问题，不自动推断已解决")
+    stamp = iso(now())
+    item = dict(old or {})
+    item.update(status="open" if a.action == "open" else "resolved", note=note,
+                evidence=ev, updated_at=stamp)
+    item.setdefault("opened_at", stamp)
+    item.setdefault("history", []).append({"action": a.action, "at": stamp,
+                                          "note": note, "evidence": ev})
+    issues[a.issue_id] = item
+    ps["issues"] = issues
+    save_status(day, s)
+    return {"ok": True, "platform": a.platform, "state": ps.get("state"),
+            "issue_id": a.issue_id, "issue_status": item["status"],
+            "open_issues": _open_issues(ps), "next": _resume_action(ps),
+            "remind": "仅更新本地问题记录；不删除/修改平台作品，不解锁重投，不自动验证截图内容"}
 
 
 def cmd_checkpoint(a) -> Dict[str, Any]:
@@ -1125,7 +1174,7 @@ def cmd_status(a) -> Dict[str, Any]:
         pack = read_json(d / "publish_pack.json", default={})
         approved = _approval_valid(d, pack, s) if pack else False
         out[d.name] = {"episode_id": s.get("episode_id"), "release_approved": approved,
-                       "next": _next_release(s, approved),
+                       "next": _next_release(s, approved), "open_issues": _issue_rows(s),
                        "platforms": {p: {k: v.get(k) for k in ("state", "post_id", "published_at")}
                                      for p, v in s.get("platforms", {}).items()},
                        "resume_actions": {p: _resume_action(v) for p, v in s.get("platforms", {}).items()}}
@@ -1134,6 +1183,9 @@ def cmd_status(a) -> Dict[str, Any]:
         reminders = []
     else:
         reminders = [*_stale_review_rows(now()), *_pending_plan_rows(now())]
+    reminders += [{"day": d.name, "episode_id": out[d.name]["episode_id"], **item,
+                   "action": "核查并处理已记录问题；实际解决后issue resolve，不重投"}
+                  for d in days for item in out[d.name]["open_issues"]]
     return {"ok": True, "episodes": out, "metrics_due": due, "followups": reminders,
             "followup_count": len(reminders)}
 
@@ -1463,6 +1515,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default=""); p.set_defaults(func=cmd_checkpoint)
     p = sp.add_parser("resume"); p.add_argument("--day-dir", required=True)
     p.add_argument("--platform", choices=PLATFORMS); p.set_defaults(func=cmd_resume)
+
+    p = sp.add_parser("issue", description="只记/关闭实际发现的问题，不改变投稿状态，不操作平台")
+    p.add_argument("action", choices=["open", "resolve"])
+    p.add_argument("--day-dir", required=True); p.add_argument("--platform", choices=PLATFORMS, required=True)
+    p.add_argument("--issue-id", required=True); p.add_argument("--note", required=True)
+    p.add_argument("--evidence", nargs="+", required=True); p.set_defaults(func=cmd_issue)
 
     p = sp.add_parser("start"); p.add_argument("--day-dir", required=True); p.add_argument("--platform", choices=PLATFORMS, required=True)
     p.set_defaults(func=cmd_start)
